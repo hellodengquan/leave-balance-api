@@ -1,14 +1,18 @@
 import time
 import random
+import hashlib
 import logging
 from functools import wraps
-from typing import Callable, Any, Type, Tuple
+from typing import Callable, Any, Type, Tuple, Set, Optional
+from datetime import date, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger(__name__)
 
 CONCURRENCY_ERRORS: Tuple[Type[Exception], ...] = (ValueError,)
+
+CURSOR_SECRET = "leave-balance-cursor-v1"
 
 
 class TransactionBoundary:
@@ -111,7 +115,7 @@ def with_retry(
     return decorator
 
 
-def is_workday(d: "date", holidays: set = None, workdays: set = None) -> bool:
+def is_workday(d: date, holidays: set = None, workdays: set = None) -> bool:
     if holidays and d in holidays:
         return False
     if workdays and d in workdays:
@@ -119,7 +123,7 @@ def is_workday(d: "date", holidays: set = None, workdays: set = None) -> bool:
     return d.weekday() < 5
 
 
-def count_workdays(start: "date", end: "date", holidays: set = None, workdays: set = None) -> int:
+def count_workdays(start: date, end: date, holidays: set = None, workdays: set = None) -> int:
     if end < start:
         return 0
     count = 0
@@ -127,15 +131,74 @@ def count_workdays(start: "date", end: "date", holidays: set = None, workdays: s
     while current <= end:
         if is_workday(current, holidays, workdays):
             count += 1
-        current += __import__("datetime").timedelta(days=1)
+        current += timedelta(days=1)
     return count
 
 
-def add_workdays(d: "date", days: int, holidays: set = None, workdays: set = None) -> "date":
+def add_workdays(d: date, days: int, holidays: set = None, workdays: set = None) -> date:
     current = d
     added = 0
     while added < days:
-        current += __import__("datetime").timedelta(days=1)
+        current += timedelta(days=1)
         if is_workday(current, holidays, workdays):
             added += 1
     return current
+
+
+def encode_cursor(txn_id: int, sort_key: str = "id_desc") -> str:
+    import base64, json
+    payload = {"id": txn_id, "sk": sort_key}
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    sig = hashlib.sha256(raw + CURSOR_SECRET.encode()).hexdigest()[:8]
+    data = {"p": payload, "s": sig}
+    return base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).decode()
+
+
+def decode_cursor(cursor: str) -> Tuple[Optional[int], Optional[str]]:
+    import base64, json
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+        payload = data.get("p", {})
+        sig = data.get("s", "")
+        expected_sig = hashlib.sha256(
+            json.dumps(payload, separators=(",", ":")).encode() + CURSOR_SECRET.encode()
+        ).hexdigest()[:8]
+        if sig != expected_sig:
+            return None, None
+        return payload.get("id"), payload.get("sk", "id_desc")
+    except Exception:
+        return None, None
+
+
+def apply_field_permissions(
+    data: dict,
+    role: str,
+    resource: str,
+    field_permissions: list
+) -> Tuple[dict, list, list]:
+    masked_fields = []
+    hidden_fields = []
+    result = {}
+    for fp in field_permissions:
+        if fp.role != role or fp.resource != resource:
+            continue
+        field = fp.field_name
+        if field not in data:
+            continue
+        if fp.access == "hidden":
+            hidden_fields.append(field)
+            continue
+        if fp.access == "masked" and fp.mask_pattern:
+            masked_fields.append(field)
+            val = str(data[field])
+            if fp.mask_pattern == "name":
+                result[field] = val[0] + "**" if len(val) > 1 else val
+            elif fp.mask_pattern == "partial":
+                result[field] = val[:2] + "***" + val[-2:] if len(val) > 4 else "***"
+            else:
+                result[field] = fp.mask_pattern
+            continue
+    for k, v in data.items():
+        if k not in hidden_fields and k not in masked_fields:
+            result[k] = v
+    return result, masked_fields, hidden_fields

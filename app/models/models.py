@@ -2,7 +2,7 @@ from datetime import datetime, date
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Date,
     ForeignKey, Boolean, Text, UniqueConstraint, Index,
-    BigInteger
+    BigInteger, Numeric
 )
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
@@ -31,6 +31,7 @@ class HolidayConfig(Base):
     name = Column(String(100))
     type = Column(String(20), default="holiday")
     year = Column(Integer, index=True)
+    substitute_for = Column(Date, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
     __table_args__ = (
@@ -52,6 +53,7 @@ class FrozenBalanceLog(Base):
     balance_after = Column(Float, nullable=False)
     operator = Column(String(100))
     reason = Column(String(500))
+    rollback_of_id = Column(Integer, ForeignKey("frozen_balance_logs.id"), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -71,6 +73,8 @@ class ExpireHold(Base):
     approved_at = Column(DateTime)
     reject_reason = Column(Text)
     operator = Column(String(100))
+    timeout_hours = Column(Integer, default=72)
+    escalated_to = Column(String(100))
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -109,6 +113,22 @@ class ExpireHoldApproval(Base):
     action = Column(String(30), nullable=False)
     comment = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class FieldPermission(Base):
+    __tablename__ = "field_permissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    role = Column(String(50), nullable=False, index=True)
+    resource = Column(String(50), nullable=False, index=True)
+    field_name = Column(String(100), nullable=False)
+    access = Column(String(20), default="visible", nullable=False)
+    mask_pattern = Column(String(100), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("role", "resource", "field_name", name="uix_role_resource_field"),
+    )
 
 
 class Employee(Base):
@@ -219,6 +239,7 @@ class LeaveApplication(Base):
     cancelled_at = Column(DateTime)
     cancel_reason = Column(Text)
     transaction_id = Column(Integer, ForeignKey("leave_transactions.id"))
+    previous_status = Column(String(30), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

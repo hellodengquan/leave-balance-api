@@ -1,7 +1,5 @@
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Tuple, Set
-import base64
-import json
+from typing import Optional, List, Tuple, Set, Dict, Any
 import uuid
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, update, func
@@ -10,12 +8,14 @@ from dateutil.relativedelta import relativedelta
 from app.models.models import (
     Employee, LeaveType, LeaveAccount, LeaveTransaction,
     LeaveApplication, HolidayConfig, FrozenBalanceLog,
-    ExpireHold, ExpireHoldApproval, GrantRetroLink, SysUser
+    ExpireHold, ExpireHoldApproval, GrantRetroLink, SysUser,
+    FieldPermission
 )
 from app.schemas import schemas
 from app.utils import (
     TransactionBoundary, transactional, with_retry,
-    is_workday, count_workdays
+    is_workday, count_workdays, encode_cursor, decode_cursor,
+    apply_field_permissions
 )
 
 
@@ -133,7 +133,8 @@ class BalanceService:
         frozen_before: float,
         frozen_after: float,
         operator: Optional[str] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        rollback_of_id: Optional[int] = None
     ) -> FrozenBalanceLog:
         log = FrozenBalanceLog(
             account_id=account.id,
@@ -145,23 +146,12 @@ class BalanceService:
             balance_before=frozen_before,
             balance_after=frozen_after,
             operator=operator,
-            reason=reason
+            reason=reason,
+            rollback_of_id=rollback_of_id
         )
         self.db.add(log)
         self.db.flush()
         return log
-
-    def _encode_cursor(self, txn_id: int, created_at: datetime) -> str:
-        data = {"id": txn_id}
-        return base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
-
-    def _decode_cursor(self, cursor: str) -> Tuple[Optional[int], Optional[datetime]]:
-        try:
-            data = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
-            txn_id = data.get("id")
-            return txn_id, None
-        except Exception:
-            return None, None
 
     @with_retry(max_retries=3, base_delay=0.1, max_delay=1.0)
     def grant_leave(
@@ -333,7 +323,8 @@ class BalanceService:
         year: Optional[int] = None,
         application_id: Optional[int] = None,
         operator: Optional[str] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        rollback_of_id: Optional[int] = None
     ) -> LeaveAccount:
         if year is None:
             year = date.today().year
@@ -361,7 +352,8 @@ class BalanceService:
                 frozen_before=frozen_before,
                 frozen_after=frozen_after,
                 operator=operator,
-                reason=reason or "申请请假冻结"
+                reason=reason or "申请请假冻结",
+                rollback_of_id=rollback_of_id
             )
 
         self.db.refresh(account)
@@ -376,7 +368,8 @@ class BalanceService:
         year: Optional[int] = None,
         application_id: Optional[int] = None,
         operator: Optional[str] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        rollback_of_id: Optional[int] = None
     ) -> LeaveAccount:
         if year is None:
             year = date.today().year
@@ -405,7 +398,8 @@ class BalanceService:
                 frozen_before=frozen_before,
                 frozen_after=frozen_after,
                 operator=operator,
-                reason=reason or "解冻"
+                reason=reason or "解冻",
+                rollback_of_id=rollback_of_id
             )
 
         self.db.refresh(account)
@@ -839,6 +833,56 @@ class BalanceService:
         self.db.refresh(hold)
         return hold
 
+    def timeout_expire_holds(
+        self, default_action: str = "approve", escalate_to: Optional[str] = None
+    ) -> List[ExpireHold]:
+        now = datetime.now()
+        pending_holds = self.db.query(ExpireHold).filter(
+            ExpireHold.status == "pending"
+        ).all()
+        processed = []
+        for hold in pending_holds:
+            elapsed_hours = (now - hold.created_at).total_seconds() / 3600
+            if elapsed_hours > hold.timeout_hours:
+                try:
+                    if default_action == "approve":
+                        result = self.approve_expire_hold(
+                            hold.id, approver=escalate_to or "system_timeout",
+                            comment=f"审批超时({elapsed_hours:.0f}h)，自动清零"
+                        )
+                    else:
+                        result = self.reject_expire_hold(
+                            hold.id, approver=escalate_to or "system_timeout",
+                            reject_reason=f"审批超时({elapsed_hours:.0f}h)，自动保留"
+                        )
+                    processed.append(result)
+                except Exception:
+                    if escalate_to:
+                        hold.escalated_to = escalate_to
+                        self.db.commit()
+        return processed
+
+    def recover_stuck_holds(self) -> List[ExpireHold]:
+        stuck = self.db.query(ExpireHold).filter(
+            ExpireHold.status == "pending"
+        ).all()
+        recovered = []
+        for hold in stuck:
+            account = self.db.query(LeaveAccount).filter(
+                LeaveAccount.id == hold.account_id
+            ).first()
+            if not account:
+                hold.status = "rejected"
+                hold.reject_reason = "账户不存在，自动关闭"
+                recovered.append(hold)
+            elif account.balance <= 0 and account.pending_expire_days <= 0:
+                hold.status = "rejected"
+                hold.reject_reason = "余额已为零，自动关闭"
+                recovered.append(hold)
+        if recovered:
+            self.db.commit()
+        return recovered
+
     def list_expire_holds(
         self,
         status: Optional[str] = None,
@@ -933,7 +977,6 @@ class BalanceService:
 
         total = query.count()
         transactions = query.order_by(
-            LeaveTransaction.created_at.desc(),
             LeaveTransaction.id.desc()
         ).offset(skip).limit(limit).all()
 
@@ -971,10 +1014,13 @@ class BalanceService:
 
         query = self._apply_permission_filter(query, LeaveTransaction)
 
+        sort_key = "id_desc"
         if cursor:
-            cursor_id, cursor_ts = self._decode_cursor(cursor)
-            if cursor_id:
-                query = query.filter(LeaveTransaction.id < cursor_id)
+            cursor_id, cursor_sk = decode_cursor(cursor)
+            if cursor_id is None:
+                raise ValueError("无效或已篡改的游标")
+            sort_key = cursor_sk or "id_desc"
+            query = query.filter(LeaveTransaction.id < cursor_id)
 
         total_count = None
         if include_total:
@@ -992,16 +1038,7 @@ class BalanceService:
         next_cursor = None
         if items and has_more:
             last = items[-1]
-            next_cursor = self._encode_cursor(last.id, last.created_at)
-
-        enriched = []
-        for txn in items:
-            retro = self.db.query(GrantRetroLink).filter(
-                GrantRetroLink.grant_transaction_id == txn.id
-            ).first()
-            txn_dict = txn.__dict__.copy()
-            txn_dict["retro_link"] = retro
-            enriched.append(txn_dict)
+            next_cursor = encode_cursor(last.id, sort_key)
 
         return schemas.KeysetPaginatedResponse(
             items=items,
@@ -1037,19 +1074,82 @@ class BalanceService:
             GrantRetroLink.grant_transaction_id == grant_transaction_id
         ).first()
 
+    def get_retro_chain(
+        self, grant_transaction_id: int, max_depth: int = 10
+    ) -> schemas.RetroLinkChain:
+        chain = []
+        visited = set()
+        current_txn_id = grant_transaction_id
+
+        for _ in range(max_depth):
+            if current_txn_id in visited:
+                break
+            visited.add(current_txn_id)
+
+            txn = self.db.query(LeaveTransaction).filter(
+                LeaveTransaction.id == current_txn_id
+            ).first()
+            if not txn:
+                break
+
+            retro = self.db.query(GrantRetroLink).filter(
+                GrantRetroLink.grant_transaction_id == current_txn_id
+            ).first()
+
+            app_no = None
+            app_id = None
+            if retro and retro.source_application_id:
+                app = self.db.query(LeaveApplication).filter(
+                    LeaveApplication.id == retro.source_application_id
+                ).first()
+                if app:
+                    app_id = app.id
+                    app_no = app.application_no
+
+            node = schemas.RetroLinkChainNode(
+                transaction_id=txn.id,
+                change_type=txn.change_type,
+                change_days=txn.change_days,
+                reason=txn.reason,
+                operator=txn.operator,
+                created_at=txn.created_at,
+                retro_link=retro,
+                related_application_id=app_id,
+                related_application_no=app_no
+            )
+            chain.append(node)
+
+            if txn.related_transaction_id:
+                current_txn_id = txn.related_transaction_id
+            elif retro and retro.source_transaction_id:
+                current_txn_id = retro.source_transaction_id
+            else:
+                break
+
+        return schemas.RetroLinkChain(
+            grant_transaction_id=grant_transaction_id,
+            chain=chain,
+            total_depth=len(chain)
+        )
+
     def add_holiday(
-        self, d: date, name: Optional[str], holiday_type: str = "holiday"
+        self, d: date, name: Optional[str], holiday_type: str = "holiday",
+        substitute_for: Optional[date] = None
     ) -> HolidayConfig:
         existing = self.db.query(HolidayConfig).filter(HolidayConfig.date == d).first()
         if existing:
             existing.name = name
             existing.type = holiday_type
             existing.year = d.year
+            existing.substitute_for = substitute_for
             self.db.commit()
             self.db.refresh(existing)
             return existing
 
-        cfg = HolidayConfig(date=d, name=name, type=holiday_type, year=d.year)
+        cfg = HolidayConfig(
+            date=d, name=name, type=holiday_type,
+            year=d.year, substitute_for=substitute_for
+        )
         self.db.add(cfg)
         self.db.commit()
         self.db.refresh(cfg)
@@ -1064,3 +1164,53 @@ class BalanceService:
         if holiday_type:
             query = query.filter(HolidayConfig.type == holiday_type)
         return query.order_by(HolidayConfig.date.asc()).all()
+
+    def get_field_permissions(
+        self, role: Optional[str] = None, resource: Optional[str] = None
+    ) -> List[FieldPermission]:
+        query = self.db.query(FieldPermission)
+        if role:
+            query = query.filter(FieldPermission.role == role)
+        if resource:
+            query = query.filter(FieldPermission.resource == resource)
+        return query.all()
+
+    def set_field_permission(
+        self, role: str, resource: str, field_name: str,
+        access: str = "visible", mask_pattern: Optional[str] = None
+    ) -> FieldPermission:
+        existing = self.db.query(FieldPermission).filter(
+            FieldPermission.role == role,
+            FieldPermission.resource == resource,
+            FieldPermission.field_name == field_name
+        ).first()
+        if existing:
+            existing.access = access
+            existing.mask_pattern = mask_pattern
+            self.db.commit()
+            self.db.refresh(existing)
+            return existing
+
+        fp = FieldPermission(
+            role=role, resource=resource, field_name=field_name,
+            access=access, mask_pattern=mask_pattern
+        )
+        self.db.add(fp)
+        self.db.commit()
+        self.db.refresh(fp)
+        return fp
+
+    def apply_field_filter(
+        self, data: dict, resource: str
+    ) -> schemas.FieldFilteredResponse:
+        if not self.auth:
+            return schemas.FieldFilteredResponse(data=data)
+        fps = self.get_field_permissions(role=self.auth.role, resource=resource)
+        if not fps:
+            return schemas.FieldFilteredResponse(data=data)
+        filtered, masked, hidden = apply_field_permissions(
+            data, self.auth.role, resource, fps
+        )
+        return schemas.FieldFilteredResponse(
+            data=filtered, masked_fields=masked, hidden_fields=hidden
+        )

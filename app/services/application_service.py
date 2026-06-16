@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.models.models import (
     Employee, LeaveType, LeaveAccount, LeaveTransaction,
-    LeaveApplication, ApprovalRecord
+    LeaveApplication, ApprovalRecord, FrozenBalanceLog
 )
 from app.schemas import schemas
 from app.services.balance_service import BalanceService
@@ -231,6 +231,7 @@ class ApplicationService:
             if application.status not in ["pending"]:
                 raise ValueError(f"当前状态为 {application.status}，无法撤销")
 
+            application.previous_status = application.status
             application.status = "cancelled"
             application.cancelled_by = data.operator
             application.cancelled_at = datetime.now()
@@ -244,6 +245,12 @@ class ApplicationService:
             )
             self.db.add(approval_record)
 
+        freeze_logs = self.db.query(FrozenBalanceLog).filter(
+            FrozenBalanceLog.application_id == application.id,
+            FrozenBalanceLog.operation == "freeze"
+        ).all()
+        freeze_log_ids = [log.id for log in freeze_logs]
+
         unfreeze_ok = False
         try:
             self.balance_service.unfreeze_balance(
@@ -253,7 +260,8 @@ class ApplicationService:
                 year=application.start_date.year,
                 application_id=application.id,
                 operator=data.operator,
-                reason=f"撤销申请解冻: {application.application_no}"
+                reason=f"撤销申请解冻: {application.application_no}",
+                rollback_of_id=freeze_log_ids[0] if freeze_log_ids else None
             )
             unfreeze_ok = True
         except Exception as e:
@@ -268,7 +276,8 @@ class ApplicationService:
                     year=application.start_date.year,
                     application_id=application.id,
                     operator=data.operator,
-                    reason=f"撤销申请解冻(重试): {application.application_no}"
+                    reason=f"撤销申请解冻(重试): {application.application_no}",
+                    rollback_of_id=freeze_log_ids[0] if freeze_log_ids else None
                 )
             except Exception:
                 pass
@@ -295,6 +304,12 @@ class ApplicationService:
             if not leave_type or not leave_type.is_active:
                 raise ValueError("假期类型已停用")
 
+        unfreeze_logs = self.db.query(FrozenBalanceLog).filter(
+            FrozenBalanceLog.application_id == application.id,
+            FrozenBalanceLog.operation == "unfreeze"
+        ).all()
+        unfreeze_log_ids = [log.id for log in unfreeze_logs]
+
         try:
             self.balance_service.freeze_balance(
                 employee_id=application.employee_id,
@@ -303,7 +318,8 @@ class ApplicationService:
                 year=application.start_date.year,
                 application_id=application.id,
                 operator=operator,
-                reason=f"恢复申请冻结: {application.application_no}"
+                reason=f"恢复申请冻结: {application.application_no}",
+                rollback_of_id=unfreeze_log_ids[0] if unfreeze_log_ids else None
             )
         except Exception as e:
             raise ValueError(f"恢复申请失败：{str(e)}")
@@ -313,7 +329,9 @@ class ApplicationService:
                 LeaveApplication.id == application_id
             ).first()
             if app:
-                app.status = "pending"
+                restore_to_status = app.previous_status or "pending"
+                app.previous_status = app.status
+                app.status = restore_to_status
                 app.cancelled_by = None
                 app.cancelled_at = None
                 app.cancel_reason = None

@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -37,6 +37,7 @@ class HolidayConfigBase(BaseModel):
     name: Optional[str] = Field(None, max_length=100)
     type: str = "holiday"
     year: int
+    substitute_for: Optional[date] = None
 
 
 class HolidayConfigCreate(HolidayConfigBase):
@@ -62,6 +63,7 @@ class FrozenBalanceLogBase(BaseModel):
     balance_after: float
     operator: Optional[str] = Field(None, max_length=100)
     reason: Optional[str] = Field(None, max_length=500)
+    rollback_of_id: Optional[int] = None
 
 
 class FrozenBalanceLog(FrozenBalanceLogBase):
@@ -103,6 +105,8 @@ class ExpireHold(ExpireHoldBase):
     approver: Optional[str] = None
     approved_at: Optional[datetime] = None
     reject_reason: Optional[str] = None
+    timeout_hours: int = 72
+    escalated_to: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -125,6 +129,44 @@ class GrantRetroLinkCreate(GrantRetroLinkBase):
 
 
 class GrantRetroLink(GrantRetroLinkBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RetroLinkChainNode(BaseModel):
+    transaction_id: int
+    change_type: str
+    change_days: float
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+    created_at: Optional[datetime] = None
+    retro_link: Optional[GrantRetroLink] = None
+    related_application_id: Optional[int] = None
+    related_application_no: Optional[str] = None
+
+
+class RetroLinkChain(BaseModel):
+    grant_transaction_id: int
+    chain: List[RetroLinkChainNode]
+    total_depth: int
+
+
+class FieldPermissionBase(BaseModel):
+    role: str = Field(..., max_length=50)
+    resource: str = Field(..., max_length=50)
+    field_name: str = Field(..., max_length=100)
+    access: str = "visible"
+    mask_pattern: Optional[str] = Field(None, max_length=100)
+
+
+class FieldPermissionCreate(FieldPermissionBase):
+    pass
+
+
+class FieldPermission(FieldPermissionBase):
     id: int
     created_at: datetime
 
@@ -282,6 +324,7 @@ class LeaveApplication(LeaveApplicationBase):
     cancelled_at: Optional[datetime] = None
     cancel_reason: Optional[str] = None
     transaction_id: Optional[int] = None
+    previous_status: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     employee: Optional[Employee] = None
@@ -358,3 +401,9 @@ class BalanceSummary(BaseModel):
     frozen_balance: float
     pending_expire_days: float = 0.0
     available_balance: float
+
+
+class FieldFilteredResponse(BaseModel):
+    data: Dict[str, Any]
+    masked_fields: List[str] = []
+    hidden_fields: List[str] = []

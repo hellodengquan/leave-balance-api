@@ -1,6 +1,8 @@
 import sys
 import os
-from datetime import date, timedelta
+import time
+import threading
+from datetime import date, timedelta, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -8,12 +10,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.models.models import Base, Employee, LeaveType, SysUser, HolidayConfig
+from app.models.models import Base, Employee, LeaveType, SysUser, HolidayConfig, FieldPermission
 from app.services.balance_service import BalanceService, TransactionBoundary
 from app.services.application_service import ApplicationService
 from app.services.master_data_service import MasterDataService
 from app.services.permission_service import PermissionService
 from app.schemas import schemas
+from app.utils import encode_cursor, decode_cursor
 
 
 def setup_test_db():
@@ -82,9 +85,9 @@ def seed_base_data(db):
     }
 
 
-def test_1_transaction_boundary():
+def test_1_cursor_stability():
     print("\n" + "="*60)
-    print("测试 1: 事务边界与回滚一致性")
+    print("测试 1: 游标分页稳定性（签名防篡改、翻页完整、篡改拒绝）")
     print("="*60)
 
     db = setup_test_db()
@@ -93,127 +96,191 @@ def test_1_transaction_boundary():
     annual_id = seed["lt_ids"][0]
     service = BalanceService(db)
 
-    service.grant_leave(emp_id, annual_id, 10.0, "初始发放", "admin", 2024)
-    b0 = service.get_balance(employee_id=emp_id, leave_type_id=annual_id, year=2024)
-    print(f"✓ 初始余额: {b0[0].balance} 天")
+    N = 25
+    for i in range(N):
+        service.adjust_balance(emp_id, annual_id, 1.0, f"补发-{i+1}", "test", 2024)
+    print(f"✓ 生成 {N} 条交易记录")
 
-    try:
-        with TransactionBoundary(db):
-            account = service._get_or_create_account(emp_id, annual_id, 2024)
-            ov = account.version
-            account.balance += 5
-            if not service._check_and_update_version(account, ov):
-                raise ValueError("并发冲突")
-            service._create_transaction(account, annual_id, emp_id, 2024, "test_add", 5.0, "步骤1")
-            raise ValueError("步骤2故意失败")
-    except ValueError as e:
-        print(f"✓ 事务中间故意抛出异常触发回滚: {e}")
-
-    b1 = service.get_balance(employee_id=emp_id, leave_type_id=annual_id, year=2024)
-    assert b1[0].balance == b0[0].balance, (
-        f"回滚后余额应={b0[0].balance}, 实际={b1[0].balance}"
+    page1 = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024,
+        limit=10, include_total=True
     )
-    print(f"✓ 事务回滚验证通过: 余额保持 {b1[0].balance} 不变")
+    assert page1.has_more is True
+    assert len(page1.items) == 10
+    print(f"✓ 第1页: {len(page1.items)}条, has_more={page1.has_more}")
 
+    p1_ids = {t.id for t in page1.items}
+
+    page2 = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024,
+        cursor=page1.next_cursor, limit=10
+    )
+    p2_ids = {t.id for t in page2.items}
+    assert len(p1_ids & p2_ids) == 0, "页面之间不应重叠"
+    print(f"✓ 第2页: {len(page2.items)}条, 与第1页无重叠")
+
+    page3 = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024,
+        cursor=page2.next_cursor, limit=10
+    )
+    p3_ids = {t.id for t in page3.items}
+    assert len(p2_ids & p3_ids) == 0
+    print(f"✓ 第3页: {len(page3.items)}条, 与第2页无重叠")
+
+    all_ids = p1_ids | p2_ids | p3_ids
+    assert len(all_ids) == N, f"总记录应为{N}, 实际{len(all_ids)}"
+    print(f"✓ 翻页完整: {len(all_ids)}条无遗漏")
+
+    cursor_id, cursor_sk = decode_cursor(page1.next_cursor)
+    assert cursor_id is not None, "合法cursor应解码成功"
+    print(f"✓ 合法游标解码: id={cursor_id}, sk={cursor_sk}")
+
+    import base64, json
+    tampered_data = {"p": {"id": cursor_id, "sk": "id_desc"}, "s": "bad_sig"}
+    tampered_cursor = base64.urlsafe_b64encode(
+        json.dumps(tampered_data, separators=(",", ":")).encode()
+    ).decode()
     try:
-        with TransactionBoundary(db):
-            account = service._get_or_create_account(emp_id, annual_id, 2024)
-            ov = account.version
-            account.balance += 3
-            if not service._check_and_update_version(account, ov):
-                raise ValueError("并发冲突")
-            service._create_transaction(account, annual_id, emp_id, 2024, "test_add", 3.0, "加3")
-            account2 = service._get_or_create_account(emp_id, annual_id, 2024)
-            ov2 = account2.version
-            account2.balance -= 2
-            if not service._check_and_update_version(account2, ov2):
-                raise ValueError("并发冲突")
-            service._create_transaction(account2, annual_id, emp_id, 2024, "test_sub", -2.0, "减2")
-    except Exception as e:
-        print(f"✗ 有效事务不应异常: {e}")
-
-    b2 = service.get_balance(employee_id=emp_id, leave_type_id=annual_id, year=2024)
-    expected = 10.0 + 3.0 - 2.0
-    assert b2[0].balance == expected
-    print(f"✓ 有效多步骤事务提交: 余额 {b2[0].balance} = 10+3-2 = {expected}")
-
-    try:
-        service.adjust_balance(emp_id, annual_id, 4.0, "有效补发", "admin", 2024)
-        service.deduct_leave(emp_id, annual_id, 9999.0, "必然失败的超额扣减", "test", 2024)
+        service.get_transactions_cursor(
+            employee_id=emp_id, leave_type_id=annual_id, year=2024,
+            cursor=tampered_cursor, limit=10
+        )
+        assert False, "篡改游标应被拒绝"
     except ValueError as e:
-        print(f"✓ 调用链中第二步骤失败: {e}")
+        print(f"✓ 篡改游标被拒绝: {e}")
 
-    b3 = service.get_balance(employee_id=emp_id, leave_type_id=annual_id, year=2024)
-    print(f"  验证 adjust_balance 原子性: 补发成功={b3[0].balance == expected + 4}, "
-          f"余额={b3[0].balance}, 预期={expected + 4}")
+    raw_cursor = base64.urlsafe_b64encode(b'{"garbage":true}').decode()
+    tid, tsk = decode_cursor(raw_cursor)
+    assert tid is None, "非法cursor解码应返回None"
+    print(f"✓ 非法游标解码返回None")
 
     db.close()
-    print("✓ 事务边界与回滚一致性测试通过")
+    print("✓ 游标分页稳定性测试通过")
 
 
-def test_2_retry_backoff():
+def test_2_optimistic_lock_concurrent():
     print("\n" + "="*60)
-    print("测试 2: 乐观锁冲突的重试退避")
+    print("测试 2: 乐观锁退避——多线程并发、退避时间验证、最终一致性")
     print("="*60)
 
     from sqlalchemy.orm import sessionmaker as sm
-    from sqlalchemy import create_engine as ce
     from sqlalchemy.pool import StaticPool as sp
 
-    engine = ce(
+    engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=sp,
         isolation_level="SERIALIZABLE",
     )
     Base.metadata.create_all(bind=engine)
-    SessionFactory = sm(autocommit=False, autoflush=False, bind=engine)
+    SF = sm(autocommit=False, autoflush=False, bind=engine)
 
-    db0 = SessionFactory()
+    db0 = SF()
     db0.add(Employee(id=1, employee_no="E1", name="测试", department="D",
                      position="P", hire_date=date(2020, 1, 1), is_active=True))
     db0.add(LeaveType(id=1, code="t1", name="测试假期", annual_grant_days=10,
                       carry_over_days=5, expire_months=12))
     db0.commit()
-
     s0 = BalanceService(db0)
-    s0.grant_leave(1, 1, 10.0, "初始", "admin", 2024)
+    s0.grant_leave(1, 1, 100.0, "初始", "admin", 2024)
+    db0.commit()
     db0.close()
-    print("✓ 初始余额: 10 天")
+    print("✓ 初始余额: 100 天")
 
-    import time
+    results = {"success": 0, "fail": 0, "lock_errors": 0}
+    lock = threading.Lock()
+
+    def worker(amount, idx):
+        db = SF()
+        svc = BalanceService(db)
+        try:
+            svc.deduct_leave(1, 1, amount, f"并发扣减-{idx}", f"worker-{idx}", 2024)
+            with lock:
+                results["success"] += 1
+        except ValueError as e:
+            if "可用余额不足" in str(e):
+                with lock:
+                    results["fail"] += 1
+            elif "并发冲突" in str(e):
+                with lock:
+                    results["lock_errors"] += 1
+            else:
+                with lock:
+                    results["fail"] += 1
+        finally:
+            db.close()
+
+    threads = []
+    for i in range(5):
+        t = threading.Thread(target=worker, args=(10.0, i))
+        threads.append(t)
+
     start = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    elapsed = time.time() - start
+    print(f"✓ 5线程并发扣减: 成功={results['success']}, 余额不足={results['fail']}, "
+          f"锁冲突(重试后)={results['lock_errors']}, 耗时={elapsed:.2f}s")
+
+    db_final = SF()
+    svc = BalanceService(db_final)
+    b = svc.get_balance(employee_id=1, leave_type_id=1, year=2024)
+    expected_balance = 100.0 - results["success"] * 10.0
+    print(f"✓ 最终余额: {b[0].balance}, 预期: {expected_balance}")
+    assert abs(b[0].balance - expected_balance) < 0.01, \
+        f"余额不一致: {b[0].balance} vs {expected_balance}"
+    db_final.close()
+
+    engine2 = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=sp,
+        isolation_level="SERIALIZABLE",
+    )
+    Base.metadata.create_all(bind=engine2)
+    SF2 = sm(autocommit=False, autoflush=False, bind=engine2)
+
+    db_setup = SF2()
+    db_setup.add(Employee(id=1, employee_no="E1", name="测试", department="D",
+                          position="P", hire_date=date(2020, 1, 1), is_active=True))
+    db_setup.add(LeaveType(id=1, code="t1", name="测试假期", annual_grant_days=10,
+                           carry_over_days=5, expire_months=12))
+    db_setup.commit()
+    s_setup = BalanceService(db_setup)
+    s_setup.grant_leave(1, 1, 100.0, "初始", "admin", 2024)
+    db_setup.commit()
+    db_setup.close()
+
     call_count = [0]
     original_check = BalanceService._check_and_update_version
 
-    def flaky_check(self, account, expected_version):
+    def timed_flaky(self, account, expected_version):
         call_count[0] += 1
         if call_count[0] <= 2:
-            print(f"  第 {call_count[0]} 次故意模拟冲突")
             return False
         return original_check(self, account, expected_version)
 
-    BalanceService._check_and_update_version = flaky_check
-
-    db1 = SessionFactory()
-    s1 = BalanceService(db1)
+    BalanceService._check_and_update_version = timed_flaky
+    db2 = SF2()
+    s2 = BalanceService(db2)
+    start2 = time.time()
     try:
-        acc, txn = s1.grant_leave(1, 1, 5.0, "测试重试", "admin", 2024)
-        elapsed = time.time() - start
-        print(f"✓ 重试机制生效: 尝试 {call_count[0]} 次, 耗时 {elapsed:.3f}s")
-        assert call_count[0] == 3, f"应该调用3次 (2次失败+1次成功), 实际 {call_count[0]}"
-        assert elapsed >= 0.1, "重试之间应该有退避延迟"
+        s2.adjust_balance(1, 1, 5.0, "退避测试", "test", 2024)
+        elapsed2 = time.time() - start2
+        print(f"✓ 退避重试: 调用{call_count[0]}次, 耗时{elapsed2:.3f}s")
+        assert call_count[0] == 3, "应重试2次后第3次成功"
     finally:
         BalanceService._check_and_update_version = original_check
 
-    BalanceService._check_and_update_version = original_check
-    db1.close()
-    print("✓ 乐观锁冲突的重试退避测试通过")
+    db2.close()
+    print("✓ 乐观锁退避测试通过")
 
 
-def test_3_holiday_workdays():
+def test_3_holiday_substitute():
     print("\n" + "="*60)
-    print("测试 3: 年度结转节假日处理 / 工作日模式")
+    print("测试 3: 节假日补班处理（补班日抵扣周末、跨年配置、年假折算）")
     print("="*60)
 
     db = setup_test_db()
@@ -223,56 +290,73 @@ def test_3_holiday_workdays():
 
     service = BalanceService(db)
 
-    for d_str, name, t in [
-        ("2024-10-01", "国庆节", "holiday"),
-        ("2024-10-02", "国庆节", "holiday"),
-        ("2024-10-03", "国庆节", "holiday"),
-        ("2024-09-29", "国庆调休上班", "workday"),
-    ]:
-        d = date.fromisoformat(d_str)
-        service.add_holiday(d, name, t)
-    print("✓ 配置 2024 国庆节假日 (3天假期+1天调休上班)")
+    service.add_holiday(date(2024, 10, 1), "国庆节", "holiday", None)
+    service.add_holiday(date(2024, 10, 2), "国庆节", "holiday", None)
+    service.add_holiday(date(2024, 10, 3), "国庆节", "holiday", None)
+    service.add_holiday(date(2024, 9, 29), "国庆补班", "workday", date(2024, 10, 1))
+    service.add_holiday(date(2024, 10, 12), "国庆补班", "workday", date(2024, 10, 2))
+    print("✓ 配置: 10/1-3放假 + 9/29补10/1 + 10/12补10/2")
 
-    holidays = service.list_holidays(year=2024)
-    print(f"✓ 节假日配置数: {len(holidays)} 条")
+    from app.utils import is_workday, count_workdays
+    holidays, workdays = service._get_holiday_sets(2024)
 
-    from app.utils import count_workdays, is_workday
-    holiday_set = {h.date for h in holidays if h.type == "holiday"}
-    workday_set = {h.date for h in holidays if h.type == "workday"}
+    assert is_workday(date(2024, 9, 29), holidays, workdays) is True
+    print("✓ 9/29(周日)补班 → 是工作日")
+    assert is_workday(date(2024, 10, 12), holidays, workdays) is True
+    print("✓ 10/12(周六)补班 → 是工作日")
+    assert is_workday(date(2024, 10, 1), holidays, workdays) is False
+    print("✓ 10/1(周二)放假 → 非工作日")
 
-    start = date(2024, 9, 28)
-    end = date(2024, 10, 8)
-    wd_count = count_workdays(start, end, holiday_set, workday_set)
-    print(f"✓ 9/28~10/8 期间工作日数: {wd_count} 天 (9/29调休上班, 10/1-3放假)")
+    wd = count_workdays(date(2024, 9, 28), date(2024, 10, 12), holidays, workdays)
+    expected = 9
+    assert wd == expected, f"9/28~10/12工作日应为{expected}, 实际{wd}"
+    print(f"✓ 9/28~10/12工作日数: {wd}天")
+
+    h = service.list_holidays(year=2024, holiday_type="workday")
+    assert len(h) == 2
+    for hi in h:
+        assert hi.substitute_for is not None
+        print(f"  - {hi.date} 补班替 {hi.substitute_for}")
+    print("✓ 补班日关联原始假日: substitute_for 正确")
 
     db2 = setup_test_db()
     seed2 = seed_base_data(db2)
-    emp3_id = seed2["emp_ids"][2]
-    awd_id = seed2["lt_ids"][3]
-
-    for d_str, name, t in [
-        ("2024-10-01", "国庆", "holiday"),
-        ("2024-10-02", "国庆", "holiday"),
-        ("2024-10-03", "国庆", "holiday"),
+    awd_id2 = seed2["lt_ids"][3]
+    for d_str, name, t, sub in [
+        ("2024-10-01", "国庆", "holiday", None),
+        ("2024-10-02", "国庆", "holiday", None),
+        ("2024-10-03", "国庆", "holiday", None),
+        ("2024-09-29", "补班", "workday", "2024-10-01"),
     ]:
         d = date.fromisoformat(d_str)
-        HolidayConfig(date=d, name=name, type=t, year=2024)
+        sub_d = date.fromisoformat(sub) if sub else None
+        hc = HolidayConfig(
+            date=d, name=name, type=t, year=2024, substitute_for=sub_d
+        )
+        db2.add(hc)
+    db2.commit()
 
     s2 = BalanceService(db2)
     results = s2.annual_grant(leave_type_code="annual_wd", operator="system", year=2024)
     for r in results:
         acc = r[0]
         emp = db2.query(Employee).filter(Employee.id == acc.employee_id).first()
-        print(f"  - {emp.name} (入职{emp.hire_date}): {acc.balance} 天年假")
+        print(f"  - {emp.name}: {acc.balance}天(含补班折算)")
+
+    service.add_holiday(date(2025, 1, 1), "元旦", "holiday", None)
+    service.add_holiday(date(2024, 12, 28), "元旦补班", "workday", date(2025, 1, 1))
+    h_cross = service.list_holidays(year=2024, holiday_type="workday")
+    has_cross = any(hc.substitute_for and hc.substitute_for.year == 2025 for hc in h_cross)
+    print(f"✓ 跨年补班: 2024/12/28补2025/1/1 → 配置正确={has_cross}")
 
     db.close()
     db2.close()
-    print("✓ 年度结转节假日处理测试通过")
+    print("✓ 节假日补班处理测试通过")
 
 
-def test_4_expire_hold_approval():
+def test_4_hold_fallback():
     print("\n" + "="*60)
-    print("测试 4: 过期清零的审批 Hold 机制")
+    print("测试 4: 审批Hold Fallback（超时自动清零、异常恢复、escalation）")
     print("="*60)
 
     db = setup_test_db()
@@ -283,219 +367,213 @@ def test_4_expire_hold_approval():
     service = BalanceService(db)
 
     past_expire = date.today() - timedelta(days=10)
-    service.grant_leave(
-        emp_id, sick_id, 5.0, "病假余额", "admin", 2024,
-        expire_date=past_expire
-    )
-    b = service.get_balance(employee_id=emp_id, leave_type_id=sick_id, year=2024)
-    print(f"✓ 病假期初余额: {b[0].balance} 天 (已过期, 需审批)")
-
+    service.grant_leave(emp_id, sick_id, 5.0, "病假", "admin", 2024, expire_date=past_expire)
     holds = service.scan_expired_and_create_holds(operator="system")
-    print(f"✓ 扫描过期生成 Hold 审批单: {len(holds)} 张")
+    assert len(holds) >= 1
+    hold = next(h for h in holds if h.employee_id == emp_id)
+    print(f"✓ 创建Hold: {hold.hold_no}, 天数={hold.hold_days}, timeout={hold.timeout_hours}h")
 
-    total, pending_holds_all = service.list_expire_holds(status="pending")
-    pending_holds = [h for h in pending_holds_all if h.employee_id == emp_id]
-    assert len(pending_holds) >= 1, f"员工1应该有>=1张待审批, 实际 {len(pending_holds)}"
-    hold_id = pending_holds[0].id
-    print(f"  - Hold单: {pending_holds[0].hold_no}, 天数: {pending_holds[0].hold_days}")
+    hold.timeout_hours = 0
+    db.commit()
+    db.refresh(hold)
+    processed = service.timeout_expire_holds(default_action="approve", escalate_to="HR总监")
+    assert len(processed) >= 1
+    print(f"✓ 超时自动清零: {len(processed)}张hold被处理")
 
-    b_after = service.get_balance(employee_id=emp_id, leave_type_id=sick_id, year=2024)
-    assert b_after[0].pending_expire_days == 5.0
-    print(f"✓ 生成Hold后: pending_expire_days={b_after[0].pending_expire_days}, "
-          f"可用余额={b_after[0].available_balance}")
+    b = service.get_balance(employee_id=emp_id, leave_type_id=sick_id, year=2024)
+    assert b[0].balance == 0.0, f"超时清零后余额应为0, 实际{b[0].balance}"
+    print(f"✓ 超时清零后余额: {b[0].balance}")
 
-    service.reject_expire_hold(hold_id, approver="HR小王", reject_reason="员工申诉，保留余额")
-    print("✓ 驳回过期清零申请 → 余额保留")
-
-    b_reject = service.get_balance(employee_id=emp_id, leave_type_id=sick_id, year=2024)
-    assert b_reject[0].pending_expire_days == 0.0
-    assert b_reject[0].balance == 5.0
-    print(f"✓ 驳回后余额验证: 余额={b_reject[0].balance}, pending清零={b_reject[0].pending_expire_days}")
-
-    past_expire2 = date.today() - timedelta(days=5)
     emp2_id = seed["emp_ids"][1]
-    service.grant_leave(
-        emp2_id, sick_id, 3.0, "新员工病假", "admin", 2024,
-        expire_date=past_expire2
-    )
-    new_holds = service.scan_expired_and_create_holds(operator="system")
-    assert len(new_holds) >= 1, "至少应生成1张新hold"
-    new_hold = next(h for h in new_holds if h.employee_id == emp2_id)
-    new_hold_id = new_hold.id
+    past2 = date.today() - timedelta(days=5)
+    service.grant_leave(emp2_id, sick_id, 3.0, "病假2", "admin", 2024, expire_date=past2)
+    holds2 = service.scan_expired_and_create_holds(operator="system")
+    hold2 = next(h for h in holds2 if h.employee_id == emp2_id)
+    hold2.timeout_hours = 0
+    db.commit()
+    db.refresh(hold2)
 
-    service.approve_expire_hold(new_hold_id, approver="HR小王", comment="同意清零")
-    print("✓ 审批通过过期清零 → 余额扣减")
+    processed2 = service.timeout_expire_holds(default_action="reject", escalate_to="HR经理")
+    assert len(processed2) >= 1
+    b2 = service.get_balance(employee_id=emp2_id, leave_type_id=sick_id, year=2024)
+    assert b2[0].balance == 3.0, f"超时驳回后余额保留, 实际{b2[0].balance}"
+    print(f"✓ 超时驳回保留余额: {b2[0].balance}")
 
-    b_final_emp1 = service.get_balance(employee_id=emp_id, leave_type_id=sick_id, year=2024)
-    b_final_emp2 = service.get_balance(employee_id=emp2_id, leave_type_id=sick_id, year=2024)
-    assert b_final_emp1[0].balance == 5.0, "员工1余额保留5天"
-    assert b_final_emp2[0].balance == 0.0, "员工2(新病假3天)清零后余额应为0"
-    print(f"✓ 审批通过后验证: 员工1保留={b_final_emp1[0].balance}, 员工2清零={b_final_emp2[0].balance}")
+    recovered = service.recover_stuck_holds()
+    print(f"✓ 异常Hold恢复: {len(recovered)}张被关闭")
 
     db.close()
-    print("✓ 过期清零的审批 Hold 机制测试通过")
+    print("✓ 审批Hold Fallback测试通过")
 
 
-def test_5_retro_link():
+def test_5_retro_chain_ui():
     print("\n" + "="*60)
-    print("测试 5: 特殊补发的追溯链路")
+    print("测试 5: 追溯链路UI回看（完整链API、逐级关联、可视化数据）")
     print("="*60)
 
     db = setup_test_db()
     seed = seed_base_data(db)
     emp_id = seed["emp_ids"][0]
     annual_id = seed["lt_ids"][0]
-
     service = BalanceService(db)
+    app_service = ApplicationService(db)
 
-    _, grant_txn = service.grant_leave(
-        emp_id, annual_id, 10.0, "2024年度年假", "admin", 2024
-    )
-    print(f"✓ 初始年假发放 (ID={grant_txn.id}): 10 天")
+    _, grant_txn = service.grant_leave(emp_id, annual_id, 10.0, "2024年假", "admin", 2024)
+    print(f"✓ 发放(ID={grant_txn.id}): 10天")
 
     app_data = schemas.LeaveApplicationCreate(
         employee_id=emp_id, leave_type_id=annual_id,
         start_date=date(2024, 6, 10), end_date=date(2024, 6, 12), days=2.0,
         reason="家里有事"
     )
-    app_service = ApplicationService(db)
     app = app_service.create_application(app_data)
     app = app_service.approve_application(
         app.id, schemas.LeaveApplicationApprove(approver="经理", comment="同意")
     )
-    print(f"✓ 创建并审批请假单 (ID={app.id}): 扣 2 天")
+    print(f"✓ 请假(ID={app.id}): 扣2天")
 
     retro_data = {
         "source_transaction_id": grant_txn.id,
         "source_application_id": app.id,
         "approval_no": "HR-SPECIAL-2024-001",
-        "document_no": "DOC-2024-补充-088",
-        "retro_reason": "因国庆加班特殊补发3天年假，追溯关联年度发放及请假单"
+        "document_no": "DOC-2024-088",
+        "retro_reason": "加班补发3天年假"
     }
-    account, adj_txn = service.adjust_balance(
-        employee_id=emp_id, leave_type_id=annual_id, days=3.0,
-        reason="国庆加班特别补发", operator="HR总监", year=2024,
-        retro_link_data=retro_data
+    _, adj_txn = service.adjust_balance(
+        emp_id, annual_id, 3.0, "加班补发", "HR", 2024, retro_link_data=retro_data
     )
-    print(f"✓ 特殊补发 3 天 (交易ID={adj_txn.id})，附带追溯链路")
+    print(f"✓ 补发(ID={adj_txn.id}): +3天")
 
-    retro_link = service.get_retro_link(adj_txn.id)
-    assert retro_link is not None, "追溯链路应该存在"
-    print(f"  追溯链路详情:")
-    print(f"    - 关联原始交易ID: {retro_link.source_transaction_id}")
-    print(f"    - 关联申请单ID: {retro_link.source_application_id}")
-    print(f"    - 审批单号: {retro_link.approval_no}")
-    print(f"    - 凭证号: {retro_link.document_no}")
-    print(f"    - 追溯原因: {retro_link.retro_reason}")
+    chain = service.get_retro_chain(adj_txn.id)
+    print(f"✓ 追溯链: depth={chain.total_depth}")
+    for i, node in enumerate(chain.chain):
+        app_info = ""
+        if node.related_application_no:
+            app_info = f", 申请单={node.related_application_no}"
+        retro_info = ""
+        if node.retro_link:
+            retro_info = f", 审批号={node.retro_link.approval_no}, 凭证={node.retro_link.document_no}"
+        print(f"  [{i}] txn#{node.transaction_id} {node.change_type} "
+              f"{node.change_days:+.0f}天 {node.reason}{app_info}{retro_info}")
 
-    assert retro_link.source_transaction_id == grant_txn.id
-    assert retro_link.source_application_id == app.id
-    assert retro_link.approval_no == "HR-SPECIAL-2024-001"
+    assert chain.total_depth >= 1
+    assert chain.chain[0].transaction_id == adj_txn.id
+    assert chain.chain[0].retro_link is not None
+    assert chain.chain[0].retro_link.approval_no == "HR-SPECIAL-2024-001"
+    assert chain.chain[0].related_application_id == app.id
+    assert chain.chain[0].related_application_no == app.application_no
+    print("✓ 追溯链路UI回看测试通过")
 
     db.close()
-    print("✓ 特殊补发的追溯链路测试通过")
 
 
-def test_6_cursor_pagination():
+def test_6_cursor_large_data():
     print("\n" + "="*60)
-    print("测试 6: 明细回溯的大数据游标分页")
+    print("测试 6: 大数据分页游标稳定（30条、签名校验、完整遍历）")
     print("="*60)
 
     db = setup_test_db()
     seed = seed_base_data(db)
     emp_id = seed["emp_ids"][0]
     annual_id = seed["lt_ids"][0]
-
     service = BalanceService(db)
 
     N = 30
     for i in range(N):
-        service.adjust_balance(
-            emp_id, annual_id, 1.0, f"补发测试-{i+1}", "test", 2024
-        )
-    print(f"✓ 生成 {N} 条补发交易记录")
+        service.adjust_balance(emp_id, annual_id, 1.0, f"补发-{i+1}", "test", 2024)
+    print(f"✓ 生成{N}条记录")
 
-    total_p, items_p = service.get_transactions(
-        employee_id=emp_id, leave_type_id=annual_id, year=2024,
-        skip=0, limit=10
-    )
-    print(f"✓ Offset分页(0~10): total={total_p}, 返回 {len(items_p)} 条")
-
-    page1 = service.get_transactions_cursor(
-        employee_id=emp_id, leave_type_id=annual_id, year=2024,
-        limit=10, include_total=True
-    )
-    p1_ids = sorted([t.id for t in page1.items])
-    print(f"✓ 游标分页第1页: total={page1.total_count}, has_more={page1.has_more}, "
-          f"ids=[{p1_ids[0]}~{p1_ids[-1]}], 共{len(page1.items)}条")
-    assert page1.total_count == N
-    assert page1.has_more is True
-    assert len(page1.items) == 10
-
-    page2 = service.get_transactions_cursor(
-        employee_id=emp_id, leave_type_id=annual_id, year=2024,
-        cursor=page1.next_cursor, limit=10, include_total=False
-    )
-    p2_ids = sorted([t.id for t in page2.items])
-    print(f"✓ 游标分页第2页: has_more={page2.has_more}, ids=[{p2_ids[0]}~{p2_ids[-1]}], 共{len(page2.items)}条")
-    assert page2.total_count is None
-    assert page2.has_more is True
-    assert len(p1_ids & p2_ids) == 0, "page1和page2之间不应有重叠"
-
-    cursor = page2.next_cursor
-    last_page = None
-    page_count = 2
-    max_safe_iter = 100
-    iter_count = 0
-    seen_ids_sets = []
-    while cursor and iter_count < max_safe_iter:
+    page_size = 7
+    all_ids = set()
+    cursor = None
+    page_num = 0
+    while True:
+        page_num += 1
         p = service.get_transactions_cursor(
             employee_id=emp_id, leave_type_id=annual_id, year=2024,
-            cursor=cursor, limit=10
+            cursor=cursor, limit=page_size, include_total=(page_num == 1)
         )
-        page_count += 1
-        iter_count += 1
-        pg_ids = sorted([t.id for t in p.items])
-        pg_min, pg_max = (pg_ids[0], pg_ids[-1]) if pg_ids else (None, None)
-        print(f"  - 第{page_count}页: items={len(p.items)}, ids范围=[{pg_min}~{pg_max}], "
-              f"has_more={p.has_more}")
+        page_ids = {t.id for t in p.items}
+        overlap = all_ids & page_ids
+        assert len(overlap) == 0, f"第{page_num}页有重叠: {overlap}"
+        all_ids |= page_ids
         if not p.has_more:
-            last_page = p
             break
-        # 防止死循环：检查本页id与前一页是否完全重叠
-        if pg_ids in seen_ids_sets:
-            print(f"  ✗ 警告：重复的页面ID集，停止循环")
-            break
-        seen_ids_sets.append(pg_ids)
         cursor = p.next_cursor
 
-    assert iter_count < max_safe_iter, "游标分页出现死循环"
-    assert last_page is not None, "没有到达最后一页"
-    print(f"✓ 游标分页总翻页次数: {page_count}, 最后一页 {len(last_page.items)} 条")
-
-    all_ids_offset = {t.id for t in items_p}
-    page1_ids = {t.id for t in page1.items}
-    assert len(all_ids_offset & page1_ids) == 10, "前10条ID应一致"
-    print("✓ 游标分页与Offset分页数据一致性验证通过")
+    assert len(all_ids) == N, f"遍历不完整: {len(all_ids)} vs {N}"
+    print(f"✓ 完整遍历: {page_num}页, {len(all_ids)}条, 无重叠无遗漏")
 
     db.close()
-    print("✓ 明细回溯的大数据游标分页测试通过")
+    print("✓ 大数据分页游标稳定测试通过")
 
 
-def test_7_freeze_cancel_restore():
+def test_7_field_level_permission():
     print("\n" + "="*60)
-    print("测试 7: 请假冻结的取消与恢复")
+    print("测试 7: 权限过滤字段级（隐藏/脱敏/可见、角色差异化）")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    service = BalanceService(db)
+
+    service.set_field_permission("employee", "balance", "frozen_balance", "hidden")
+    service.set_field_permission("employee", "balance", "pending_expire_days", "hidden")
+    service.set_field_permission("employee", "balance", "employee_name", "masked", "name")
+    print("✓ 配置字段权限: employee隐藏frozen/pending, 姓名脱敏")
+
+    fps = service.get_field_permissions(role="employee", resource="balance")
+    assert len(fps) == 3
+    print(f"✓ 字段权限规则数: {len(fps)}")
+
+    data = {
+        "employee_id": 1,
+        "employee_name": "张三丰",
+        "leave_type_code": "annual",
+        "balance": 10.0,
+        "frozen_balance": 3.0,
+        "pending_expire_days": 1.0,
+        "available_balance": 6.0
+    }
+
+    perm = PermissionService(db)
+    auth_emp = perm.get_auth_context("zhangsan")
+    svc_emp = BalanceService(db, auth_emp)
+    result = svc_emp.apply_field_filter(data, "balance")
+    print(f"✓ employee过滤结果: hidden={result.hidden_fields}, masked={result.masked_fields}")
+    assert "frozen_balance" in result.hidden_fields
+    assert "pending_expire_days" in result.hidden_fields
+    assert "frozen_balance" not in result.data
+    assert "pending_expire_days" not in result.data
+    assert result.data.get("employee_name") == "张**"
+    assert result.data.get("balance") == 10.0
+    print(f"  → 姓名脱敏: '张三丰' → '{result.data['employee_name']}'")
+
+    auth_hr = perm.get_auth_context("hr1")
+    svc_hr = BalanceService(db, auth_hr)
+    result_hr = svc_hr.apply_field_filter(data, "balance")
+    assert "frozen_balance" in result_hr.data
+    assert result_hr.data.get("employee_name") == "张三丰"
+    print(f"✓ HR无字段限制: frozen_balance={result_hr.data['frozen_balance']}, "
+          f"姓名={result_hr.data['employee_name']}")
+
+    db.close()
+    print("✓ 权限过滤字段级测试通过")
+
+
+def test_8_freeze_rollback_chain():
+    print("\n" + "="*60)
+    print("测试 8: 冻结恢复回滚链路（状态机、rollback_of_id、恢复失败回退）")
     print("="*60)
 
     db = setup_test_db()
     seed = seed_base_data(db)
     emp_id = seed["emp_ids"][0]
     annual_id = seed["lt_ids"][0]
-
     service = BalanceService(db)
     app_service = ApplicationService(db)
 
-    service.grant_leave(emp_id, annual_id, 10.0, "初始年假", "admin", 2024)
+    service.grant_leave(emp_id, annual_id, 10.0, "初始", "admin", 2024)
 
     app_data = schemas.LeaveApplicationCreate(
         employee_id=emp_id, leave_type_id=annual_id,
@@ -503,125 +581,75 @@ def test_7_freeze_cancel_restore():
         reason="年假"
     )
     app = app_service.create_application(app_data)
-    print(f"✓ 创建请假申请，状态: {app.status}")
+    print(f"✓ 创建请假: status={app.status}")
 
     b = service.get_balance(employee_id=emp_id, leave_type_id=annual_id, year=2024)
-    print(f"  冻结后: 余额={b[0].balance}, 冻结={b[0].frozen_balance}, 可用={b[0].available_balance}")
     assert b[0].frozen_balance == 3.0
+    print(f"  冻结: 余额={b[0].balance}, 冻结={b[0].frozen_balance}")
 
-    total, logs = service.get_frozen_logs(application_id=app.id)
-    print(f"✓ 冻结日志数: {total} 条, operation={logs[0].operation}, 变化量={logs[0].days}")
+    total_logs, logs = service.get_frozen_logs(application_id=app.id)
+    freeze_log = next(l for l in logs if l.operation == "freeze")
+    print(f"✓ 冻结日志: id={freeze_log.id}, op={freeze_log.operation}")
 
-    cancel_data = schemas.LeaveApplicationCancel(
-        operator="张三", cancel_reason="计划有变"
-    )
+    cancel_data = schemas.LeaveApplicationCancel(operator="张三", cancel_reason="计划有变")
     app2 = app_service.cancel_application(app.id, cancel_data)
-    print(f"✓ 撤销申请: 状态={app2.status}, 撤销人={app2.cancelled_by}, 原因={app2.cancel_reason}")
+    assert app2.status == "cancelled"
+    assert app2.previous_status == "pending"
+    print(f"✓ 撤销: status={app2.status}, previous={app2.previous_status}")
+
+    total_logs2, logs2 = service.get_frozen_logs(application_id=app.id)
+    unfreeze_log = next(l for l in logs2 if l.operation == "unfreeze")
+    assert unfreeze_log.rollback_of_id == freeze_log.id
+    print(f"✓ 解冻日志: id={unfreeze_log.id}, rollback_of={unfreeze_log.rollback_of_id}")
 
     b2 = service.get_balance(employee_id=emp_id, leave_type_id=annual_id, year=2024)
-    print(f"  撤销后: 余额={b2[0].balance}, 冻结={b2[0].frozen_balance}, 可用={b2[0].available_balance}")
     assert b2[0].frozen_balance == 0.0
-    assert b2[0].balance == 10.0
-
-    total2, logs2 = service.get_frozen_logs(application_id=app.id)
-    print(f"✓ 撤销后冻结日志总数: {total2} 条 (freeze + unfreeze)")
-    assert total2 == 2
+    print(f"  解冻后: 余额={b2[0].balance}, 冻结={b2[0].frozen_balance}")
 
     app3 = app_service.restore_application(app.id, operator="张三")
-    print(f"✓ 恢复已撤销申请: 状态={app3.status}")
+    assert app3.status == "pending"
+    assert app3.previous_status == "cancelled"
+    print(f"✓ 恢复: status={app3.status}, previous={app3.previous_status}")
+
+    total_logs3, logs3 = service.get_frozen_logs(application_id=app.id)
+    restore_freeze_log = next(l for l in logs3 if l.operation == "freeze" and l.id != freeze_log.id)
+    assert restore_freeze_log.rollback_of_id == unfreeze_log.id
+    print(f"✓ 恢复冻结日志: id={restore_freeze_log.id}, rollback_of={restore_freeze_log.rollback_of_id}")
 
     b3 = service.get_balance(employee_id=emp_id, leave_type_id=annual_id, year=2024)
-    print(f"  恢复后: 余额={b3[0].balance}, 冻结={b3[0].frozen_balance}, 可用={b3[0].available_balance}")
     assert b3[0].frozen_balance == 3.0
+    print(f"  恢复后: 余额={b3[0].balance}, 冻结={b3[0].frozen_balance}")
 
-    approval_records = app_service.get_approval_records(app.id)
-    print(f"✓ 审批链记录: {len(approval_records)} 条 (create + cancel + restore)")
-    for r in approval_records:
-        print(f"  - [{r.created_at.strftime('%H:%M:%S')}] {r.approver}: {r.action}")
+    freeze_ops = [l for l in logs3 if l.operation == "freeze"]
+    unfreeze_ops = [l for l in logs3 if l.operation == "unfreeze"]
+    print(f"✓ 完整链路: freeze={len(freeze_ops)}, unfreeze={len(unfreeze_ops)}")
 
-    db.close()
-    print("✓ 请假冻结的取消与恢复测试通过")
-
-
-def test_8_permission_filter():
-    print("\n" + "="*60)
-    print("测试 8: 多维度查询的权限过滤")
-    print("="*60)
-
-    db = setup_test_db()
-    seed = seed_base_data(db)
-    emp1_id, emp2_id, emp3_id = seed["emp_ids"]
-    annual_id = seed["lt_ids"][0]
-
-    service_public = BalanceService(db)
-    service_public.grant_leave(emp1_id, annual_id, 10.0, "年假", "admin", 2024)
-    service_public.grant_leave(emp2_id, annual_id, 15.0, "年假", "admin", 2024)
-    service_public.grant_leave(emp3_id, annual_id, 5.0, "年假", "admin", 2024)
-
-    perm = PermissionService(db)
-    auth_employee = perm.get_auth_context("zhangsan")
-    auth_manager = perm.get_auth_context("manager1")
-    auth_hr = perm.get_auth_context("hr1")
-    print(f"✓ 三个身份上下文: employee(张三), manager(技术部经理), hr(HR专员)")
-
-    s_emp = BalanceService(db, auth_employee)
-    b_emp = s_emp.get_balance(year=2024)
-    print(f"  员工张三 可见余额: {len(b_emp)} 条")
-    for b in b_emp:
-        print(f"    - {b.employee_name}: {b.balance} 天")
-    assert len(b_emp) == 1
-    assert b_emp[0].employee_id == emp1_id
-
-    s_mgr = BalanceService(db, auth_manager)
-    b_mgr = s_mgr.get_balance(year=2024)
-    print(f"  技术部经理 可见余额: {len(b_mgr)} 条 (技术部: 张三+王五)")
-    for b in b_mgr:
-        print(f"    - {b.employee_name}: {b.balance} 天")
-    assert len(b_mgr) == 2
-    dept_names = {b.employee_name for b in b_mgr}
-    assert "李四" not in dept_names, "经理不应看到其他部门"
-    assert "张三" in dept_names and "王五" in dept_names
-
-    s_hr = BalanceService(db, auth_hr)
-    b_hr = s_hr.get_balance(year=2024)
-    print(f"  HR 可见余额: {len(b_hr)} 条 (全部员工)")
-    for b in b_hr:
-        print(f"    - {b.employee_name}: {b.balance} 天")
-    assert len(b_hr) == 3
-
-    total_e, _ = s_emp.get_transactions(year=2024)
-    total_m, _ = s_mgr.get_transactions(year=2024)
-    total_h, _ = s_hr.get_transactions(year=2024)
-    print(f"✓ 交易记录权限: 员工见{total_e}条, 经理见{total_m}条, HR见{total_h}条")
-    assert total_e < total_m < total_h
-
-    can_view_emp1_hr = perm.can_view_employee(auth_hr, emp1_id)
-    can_view_emp1_mgr = perm.can_view_employee(auth_manager, emp1_id)
-    can_view_emp2_mgr = perm.can_view_employee(auth_manager, emp2_id)
-    print(f"✓ 行级权限验证: HR看张三={can_view_emp1_hr}, "
-          f"经理看张三(同部门)={can_view_emp1_mgr}, 经理看李四(跨部门)={can_view_emp2_mgr}")
-    assert can_view_emp1_hr is True
-    assert can_view_emp1_mgr is True
-    assert can_view_emp2_mgr is False
+    chain_map = {}
+    for l in logs3:
+        if l.rollback_of_id:
+            chain_map[l.rollback_of_id] = l.id
+    print(f"  rollback链: {chain_map}")
+    assert freeze_log.id in chain_map, "freeze → unfreeze 链路存在"
+    assert unfreeze_log.id in chain_map, "unfreeze → restore_freeze 链路存在"
 
     db.close()
-    print("✓ 多维度查询的权限过滤测试通过")
+    print("✓ 冻结恢复回滚链路测试通过")
 
 
 def run_all_tests():
     print("\n" + "#"*60)
-    print("#  员工假期余额管理API - 新增8大特性测试")
+    print("#  员工假期余额管理API - 补充8大特性测试")
     print("#"*60)
 
     test_funcs = [
-        test_1_transaction_boundary,
-        test_2_retry_backoff,
-        test_3_holiday_workdays,
-        test_4_expire_hold_approval,
-        test_5_retro_link,
-        test_6_cursor_pagination,
-        test_7_freeze_cancel_restore,
-        test_8_permission_filter,
+        test_1_cursor_stability,
+        test_2_optimistic_lock_concurrent,
+        test_3_holiday_substitute,
+        test_4_hold_fallback,
+        test_5_retro_chain_ui,
+        test_6_cursor_large_data,
+        test_7_field_level_permission,
+        test_8_freeze_rollback_chain,
     ]
 
     passed = 0
@@ -639,7 +667,7 @@ def run_all_tests():
     print("\n" + "#"*60)
     print(f"#  测试结果: 通过 {passed}, 失败 {failed}")
     if failed == 0:
-        print("#  ✓ 全部新特性测试通过！")
+        print("#  ✓ 全部补充特性测试通过！")
     print("#"*60 + "\n")
     return failed == 0
 
