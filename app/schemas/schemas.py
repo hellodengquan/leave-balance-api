@@ -1,6 +1,135 @@
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Any
 from pydantic import BaseModel, Field, field_validator
+
+
+class SysUserBase(BaseModel):
+    username: str = Field(..., max_length=100)
+    name: str = Field(..., max_length=100)
+    employee_id: Optional[int] = None
+    role: str = "employee"
+    department: Optional[str] = Field(None, max_length=100)
+    is_active: Optional[bool] = True
+
+
+class SysUserCreate(SysUserBase):
+    pass
+
+
+class SysUser(SysUserBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AuthContext(BaseModel):
+    user_id: int
+    username: str
+    role: str
+    employee_id: Optional[int] = None
+    department: Optional[str] = None
+
+
+class HolidayConfigBase(BaseModel):
+    date: date
+    name: Optional[str] = Field(None, max_length=100)
+    type: str = "holiday"
+    year: int
+
+
+class HolidayConfigCreate(HolidayConfigBase):
+    pass
+
+
+class HolidayConfig(HolidayConfigBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FrozenBalanceLogBase(BaseModel):
+    account_id: int
+    employee_id: int
+    leave_type_id: int
+    application_id: Optional[int] = None
+    operation: str = Field(..., max_length=30)
+    days: float
+    balance_before: float
+    balance_after: float
+    operator: Optional[str] = Field(None, max_length=100)
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+class FrozenBalanceLog(FrozenBalanceLogBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ExpireHoldBase(BaseModel):
+    employee_id: int
+    leave_type_id: int
+    account_id: int
+    transaction_id: int
+    expire_date: date
+    hold_days: float
+    operator: Optional[str] = Field(None, max_length=100)
+
+
+class ExpireHoldCreate(ExpireHoldBase):
+    pass
+
+
+class ExpireHoldApprove(BaseModel):
+    approver: str = Field(..., max_length=100)
+    comment: Optional[str] = None
+
+
+class ExpireHoldReject(BaseModel):
+    approver: str = Field(..., max_length=100)
+    reject_reason: str = Field(..., max_length=500)
+
+
+class ExpireHold(ExpireHoldBase):
+    id: int
+    hold_no: str
+    status: str
+    approver: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    reject_reason: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class GrantRetroLinkBase(BaseModel):
+    grant_transaction_id: int
+    source_transaction_id: Optional[int] = None
+    source_application_id: Optional[int] = None
+    approval_no: Optional[str] = Field(None, max_length=100)
+    document_no: Optional[str] = Field(None, max_length=100)
+    retro_reason: str = Field(..., max_length=500)
+    created_by: str = Field(..., max_length=100)
+
+
+class GrantRetroLinkCreate(GrantRetroLinkBase):
+    pass
+
+
+class GrantRetroLink(GrantRetroLinkBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class EmployeeBase(BaseModel):
@@ -33,6 +162,8 @@ class LeaveTypeBase(BaseModel):
     carry_over_days: float = 0.0
     expire_months: int = 12
     unit: str = "day"
+    use_workdays: bool = False
+    require_expire_approval: bool = False
     is_active: Optional[bool] = True
 
 
@@ -54,6 +185,7 @@ class LeaveAccountBase(BaseModel):
     year: int
     balance: float = 0.0
     frozen_balance: float = 0.0
+    pending_expire_days: float = 0.0
 
 
 class LeaveAccount(LeaveAccountBase):
@@ -92,9 +224,12 @@ class LeaveTransaction(LeaveTransactionBase):
     employee_id: int
     year: int
     balance_after: float
+    frozen_after: float = 0.0
     is_reversed: bool
     reversed_by_id: Optional[int] = None
+    related_transaction_id: Optional[int] = None
     created_at: datetime
+    retro_link: Optional[GrantRetroLink] = None
 
     class Config:
         from_attributes = True
@@ -130,18 +265,28 @@ class LeaveApplicationReject(BaseModel):
     reject_reason: str = Field(..., max_length=500)
 
 
+class LeaveApplicationCancel(BaseModel):
+    operator: str = Field(..., max_length=100)
+    cancel_reason: Optional[str] = Field(None, max_length=500)
+
+
 class LeaveApplication(LeaveApplicationBase):
     id: int
     application_no: str
+    work_days: Optional[float] = None
     status: str
     approver: Optional[str] = None
     approved_at: Optional[datetime] = None
     reject_reason: Optional[str] = None
+    cancelled_by: Optional[str] = None
+    cancelled_at: Optional[datetime] = None
+    cancel_reason: Optional[str] = None
     transaction_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     employee: Optional[Employee] = None
     leave_type: Optional[LeaveType] = None
+    frozen_logs: Optional[List[FrozenBalanceLog]] = None
 
     class Config:
         from_attributes = True
@@ -155,6 +300,10 @@ class BalanceAdjustment(BaseModel):
     reason: str = Field(..., max_length=500)
     operator: str = Field(..., max_length=100)
     expire_date: Optional[date] = None
+    retro_source_transaction_id: Optional[int] = None
+    retro_source_application_id: Optional[int] = None
+    retro_approval_no: Optional[str] = None
+    retro_document_no: Optional[str] = None
 
 
 class AnnualGrant(BaseModel):
@@ -187,6 +336,13 @@ class TransactionQuery(BaseModel):
     source_id: Optional[str] = None
 
 
+class KeysetPaginatedResponse(BaseModel):
+    items: List
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+    total_count: Optional[int] = None
+
+
 class PaginatedResponse(BaseModel):
     total: int
     items: List
@@ -200,4 +356,5 @@ class BalanceSummary(BaseModel):
     year: int
     balance: float
     frozen_balance: float
+    pending_expire_days: float = 0.0
     available_balance: float

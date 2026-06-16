@@ -1,12 +1,114 @@
 from datetime import datetime, date
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Date,
-    ForeignKey, Boolean, Text, UniqueConstraint, Index
+    ForeignKey, Boolean, Text, UniqueConstraint, Index,
+    BigInteger
 )
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
 
 Base = declarative_base()
+
+
+class SysUser(Base):
+    __tablename__ = "sys_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(100), unique=True, index=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    role = Column(String(50), default="employee", nullable=False)
+    department = Column(String(100))
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class HolidayConfig(Base):
+    __tablename__ = "holiday_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False, index=True)
+    name = Column(String(100))
+    type = Column(String(20), default="holiday")
+    year = Column(Integer, index=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("date", name="uix_holiday_date"),
+    )
+
+
+class FrozenBalanceLog(Base):
+    __tablename__ = "frozen_balance_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(Integer, ForeignKey("leave_accounts.id"), nullable=False, index=True)
+    employee_id = Column(Integer, nullable=False, index=True)
+    leave_type_id = Column(Integer, nullable=False)
+    application_id = Column(Integer, ForeignKey("leave_applications.id"), nullable=True, index=True)
+    operation = Column(String(30), nullable=False)
+    days = Column(Float, nullable=False)
+    balance_before = Column(Float, nullable=False)
+    balance_after = Column(Float, nullable=False)
+    operator = Column(String(100))
+    reason = Column(String(500))
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ExpireHold(Base):
+    __tablename__ = "expire_holds"
+
+    id = Column(Integer, primary_key=True, index=True)
+    hold_no = Column(String(50), unique=True, index=True, nullable=False)
+    employee_id = Column(Integer, nullable=False, index=True)
+    leave_type_id = Column(Integer, nullable=False)
+    account_id = Column(Integer, ForeignKey("leave_accounts.id"), nullable=False)
+    transaction_id = Column(Integer, ForeignKey("leave_transactions.id"), nullable=False)
+    expire_date = Column(Date, nullable=False, index=True)
+    hold_days = Column(Float, nullable=False)
+    status = Column(String(30), default="pending", nullable=False)
+    approver = Column(String(100))
+    approved_at = Column(DateTime)
+    reject_reason = Column(Text)
+    operator = Column(String(100))
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class GrantRetroLink(Base):
+    __tablename__ = "grant_retro_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    grant_transaction_id = Column(Integer, ForeignKey("leave_transactions.id"), nullable=False, index=True)
+    source_transaction_id = Column(Integer, ForeignKey("leave_transactions.id"), nullable=True)
+    source_application_id = Column(Integer, ForeignKey("leave_applications.id"), nullable=True)
+    approval_no = Column(String(100))
+    document_no = Column(String(100))
+    retro_reason = Column(String(500))
+    created_by = Column(String(100))
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ApprovalRecord(Base):
+    __tablename__ = "approval_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    application_id = Column(Integer, ForeignKey("leave_applications.id"), nullable=False)
+    approver = Column(String(100), nullable=False)
+    action = Column(String(30), nullable=False)
+    comment = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ExpireHoldApproval(Base):
+    __tablename__ = "expire_hold_approvals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    hold_id = Column(Integer, ForeignKey("expire_holds.id"), nullable=False)
+    approver = Column(String(100), nullable=False)
+    action = Column(String(30), nullable=False)
+    comment = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class Employee(Base):
@@ -37,6 +139,8 @@ class LeaveType(Base):
     carry_over_days = Column(Float, default=0.0)
     expire_months = Column(Integer, default=12)
     unit = Column(String(20), default="day")
+    use_workdays = Column(Boolean, default=False)
+    require_expire_approval = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, server_default=func.now())
 
@@ -54,6 +158,7 @@ class LeaveAccount(Base):
     year = Column(Integer, nullable=False)
     balance = Column(Float, default=0.0, nullable=False)
     frozen_balance = Column(Float, default=0.0)
+    pending_expire_days = Column(Float, default=0.0)
     version = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -71,7 +176,7 @@ class LeaveAccount(Base):
 class LeaveTransaction(Base):
     __tablename__ = "leave_transactions"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     account_id = Column(Integer, ForeignKey("leave_accounts.id"), nullable=False)
     leave_type_id = Column(Integer, ForeignKey("leave_types.id"), nullable=False)
     employee_id = Column(Integer, nullable=False)
@@ -79,16 +184,18 @@ class LeaveTransaction(Base):
     change_type = Column(String(50), nullable=False)
     change_days = Column(Float, nullable=False)
     balance_after = Column(Float, nullable=False)
+    frozen_after = Column(Float, default=0.0)
     reason = Column(String(500))
     source_id = Column(String(100))
     source_type = Column(String(50))
     operator = Column(String(100))
-    expire_date = Column(Date)
+    expire_date = Column(Date, index=True)
     is_reversed = Column(Boolean, default=False)
     reversed_by_id = Column(Integer, ForeignKey("leave_transactions.id"))
-    created_at = Column(DateTime, server_default=func.now())
+    related_transaction_id = Column(Integer, ForeignKey("leave_transactions.id"))
+    created_at = Column(DateTime, server_default=func.now(), index=True)
 
-    account = relationship("LeaveAccount", back_populates="transactions")
+    account = relationship("LeaveAccount", back_populates="transactions", foreign_keys=[account_id])
     leave_type = relationship("LeaveType", back_populates="transactions")
 
 
@@ -102,25 +209,18 @@ class LeaveApplication(Base):
     start_date = Column(Date, nullable=False)
     end_date = Column(Date, nullable=False)
     days = Column(Float, nullable=False)
+    work_days = Column(Float)
     status = Column(String(30), default="pending", nullable=False)
     reason = Column(Text)
     approver = Column(String(100))
     approved_at = Column(DateTime)
     reject_reason = Column(Text)
+    cancelled_by = Column(String(100))
+    cancelled_at = Column(DateTime)
+    cancel_reason = Column(Text)
     transaction_id = Column(Integer, ForeignKey("leave_transactions.id"))
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     employee = relationship("Employee", back_populates="applications")
     leave_type = relationship("LeaveType", back_populates="applications")
-
-
-class ApprovalRecord(Base):
-    __tablename__ = "approval_records"
-
-    id = Column(Integer, primary_key=True, index=True)
-    application_id = Column(Integer, ForeignKey("leave_applications.id"), nullable=False)
-    approver = Column(String(100), nullable=False)
-    action = Column(String(30), nullable=False)
-    comment = Column(Text)
-    created_at = Column(DateTime, server_default=func.now())

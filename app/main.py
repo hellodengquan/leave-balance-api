@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.database import init_db
-from app.routers import master_data, balance, applications
+from app.routers import master_data, balance, applications, system
 
 
 @asynccontextmanager
@@ -55,3 +55,4 @@ def health_check():
 app.include_router(master_data.router, prefix=settings.API_V1_PREFIX)
 app.include_router(balance.router, prefix=settings.API_V1_PREFIX)
 app.include_router(applications.router, prefix=settings.API_V1_PREFIX)
+app.include_router(system.router, prefix=settings.API_V1_PREFIX)

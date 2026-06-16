@@ -9,16 +9,34 @@ from app.models.models import (
 )
 from app.schemas import schemas
 from app.services.balance_service import BalanceService
+from app.utils import TransactionBoundary, with_retry, count_workdays
 
 
 class ApplicationService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, auth: Optional[schemas.AuthContext] = None):
         self.db = db
-        self.balance_service = BalanceService(db)
+        self.auth = auth
+        self.balance_service = BalanceService(db, auth)
 
     def _generate_application_no(self) -> str:
         return f"LA{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6].upper()}"
 
+    def _apply_permission_filter(self, query):
+        if not self.auth:
+            return query
+        from app.services.permission_service import PermissionService
+        perm = PermissionService(self.db)
+        return perm.filter_applications_query(query, self.auth)
+
+    def _calculate_work_days(
+        self, leave_type: LeaveType, start: date, end: date
+    ) -> Optional[float]:
+        if not leave_type.use_workdays:
+            return None
+        holidays, workdays = self.balance_service._get_holiday_sets(start.year)
+        return float(count_workdays(start, end, holidays, workdays))
+
+    @with_retry(max_retries=3, base_delay=0.15, max_delay=1.5)
     def create_application(
         self, data: schemas.LeaveApplicationCreate
     ) -> LeaveApplication:
@@ -39,65 +57,94 @@ class ApplicationService:
         if data.end_date < data.start_date:
             raise ValueError("结束日期不能早于开始日期")
 
-        application = LeaveApplication(
-            application_no=self._generate_application_no(),
-            employee_id=data.employee_id,
-            leave_type_id=data.leave_type_id,
-            start_date=data.start_date,
-            end_date=data.end_date,
-            days=data.days,
-            status="pending",
-            reason=data.reason
-        )
-        self.db.add(application)
-        self.db.flush()
-        self.db.commit()
-        self.db.refresh(application)
+        operator = self.auth.username if self.auth else "system"
+        work_days = self._calculate_work_days(leave_type, data.start_date, data.end_date)
 
+        with TransactionBoundary(self.db):
+            application = LeaveApplication(
+                application_no=self._generate_application_no(),
+                employee_id=data.employee_id,
+                leave_type_id=data.leave_type_id,
+                start_date=data.start_date,
+                end_date=data.end_date,
+                days=data.days,
+                work_days=work_days,
+                status="pending",
+                reason=data.reason
+            )
+            self.db.add(application)
+            self.db.flush()
+            self.db.refresh(application)
+
+        freeze_reason = f"申请单冻结: {application.application_no}"
         try:
             self.balance_service.freeze_balance(
                 employee_id=data.employee_id,
                 leave_type_id=data.leave_type_id,
                 days=data.days,
-                year=data.start_date.year
+                year=data.start_date.year,
+                application_id=application.id,
+                operator=operator,
+                reason=freeze_reason
             )
         except Exception as e:
-            application.status = "cancelled"
-            self.db.commit()
+            with TransactionBoundary(self.db):
+                app = self.db.query(LeaveApplication).filter(
+                    LeaveApplication.id == application.id
+                ).first()
+                if app:
+                    app.status = "cancelled"
+                    app.cancel_reason = f"冻结失败: {str(e)}"
             raise ValueError(f"创建申请失败：{str(e)}")
 
+        self.db.refresh(application)
         return application
 
+    @with_retry(max_retries=3, base_delay=0.15, max_delay=1.5)
     def approve_application(
         self, application_id: int, data: schemas.LeaveApplicationApprove
     ) -> LeaveApplication:
-        application = self.db.query(LeaveApplication).filter(
-            LeaveApplication.id == application_id
-        ).first()
-        if not application:
-            raise ValueError("申请单不存在")
+        if self.auth:
+            from app.services.permission_service import PermissionService
+            perm = PermissionService(self.db)
+            if not perm.has_role(self.auth, perm.ROLE_MANAGER):
+                app = self.db.query(LeaveApplication).filter(
+                    LeaveApplication.id == application_id
+                ).first()
+                if app and not perm.can_approve_application(self.auth, app):
+                    raise PermissionError("无权限审批此申请")
 
-        if application.status != "pending":
-            raise ValueError(f"当前状态为 {application.status}，无法审批")
+        with TransactionBoundary(self.db):
+            application = self.db.query(LeaveApplication).filter(
+                LeaveApplication.id == application_id
+            ).first()
+            if not application:
+                raise ValueError("申请单不存在")
 
-        application.status = "approved"
-        application.approver = data.approver
-        application.approved_at = datetime.now()
+            if application.status != "pending":
+                raise ValueError(f"当前状态为 {application.status}，无法审批")
 
-        approval_record = ApprovalRecord(
-            application_id=application.id,
-            approver=data.approver,
-            action="approve",
-            comment=data.comment
-        )
-        self.db.add(approval_record)
+            application.status = "approved"
+            application.approver = data.approver
+            application.approved_at = datetime.now()
+
+            approval_record = ApprovalRecord(
+                application_id=application.id,
+                approver=data.approver,
+                action="approve",
+                comment=data.comment
+            )
+            self.db.add(approval_record)
 
         try:
             self.balance_service.unfreeze_balance(
                 employee_id=application.employee_id,
                 leave_type_id=application.leave_type_id,
                 days=application.days,
-                year=application.start_date.year
+                year=application.start_date.year,
+                application_id=application.id,
+                operator=data.approver,
+                reason=f"审批通过解冻: {application.application_no}"
             )
 
             account, transaction = self.balance_service.deduct_leave(
@@ -110,93 +157,188 @@ class ApplicationService:
                 source_id=str(application.id),
                 source_type="leave_application"
             )
-            application.transaction_id = transaction.id
+            with TransactionBoundary(self.db):
+                app = self.db.query(LeaveApplication).filter(
+                    LeaveApplication.id == application.id
+                ).first()
+                if app:
+                    app.transaction_id = transaction.id
         except Exception as e:
-            self.db.rollback()
+            with TransactionBoundary(self.db):
+                app = self.db.query(LeaveApplication).filter(
+                    LeaveApplication.id == application.id
+                ).first()
+                if app and app.status == "approved":
+                    app.status = "pending"
+                    app.approver = None
+                    app.approved_at = None
             raise ValueError(f"审批失败：{str(e)}")
 
-        self.db.commit()
         self.db.refresh(application)
         return application
 
     def reject_application(
         self, application_id: int, data: schemas.LeaveApplicationReject
     ) -> LeaveApplication:
-        application = self.db.query(LeaveApplication).filter(
-            LeaveApplication.id == application_id
-        ).first()
-        if not application:
-            raise ValueError("申请单不存在")
+        with TransactionBoundary(self.db):
+            application = self.db.query(LeaveApplication).filter(
+                LeaveApplication.id == application_id
+            ).first()
+            if not application:
+                raise ValueError("申请单不存在")
 
-        if application.status != "pending":
-            raise ValueError(f"当前状态为 {application.status}，无法驳回")
+            if application.status != "pending":
+                raise ValueError(f"当前状态为 {application.status}，无法驳回")
 
-        application.status = "rejected"
-        application.approver = data.approver
-        application.reject_reason = data.reject_reason
+            application.status = "rejected"
+            application.approver = data.approver
+            application.reject_reason = data.reject_reason
 
-        approval_record = ApprovalRecord(
-            application_id=application.id,
-            approver=data.approver,
-            action="reject",
-            comment=data.reject_reason
-        )
-        self.db.add(approval_record)
+            approval_record = ApprovalRecord(
+                application_id=application.id,
+                approver=data.approver,
+                action="reject",
+                comment=data.reject_reason
+            )
+            self.db.add(approval_record)
 
         try:
             self.balance_service.unfreeze_balance(
                 employee_id=application.employee_id,
                 leave_type_id=application.leave_type_id,
                 days=application.days,
-                year=application.start_date.year
+                year=application.start_date.year,
+                application_id=application.id,
+                operator=data.approver,
+                reason=f"审批驳回解冻: {application.application_no}"
             )
         except Exception:
             pass
 
-        self.db.commit()
         self.db.refresh(application)
         return application
 
     def cancel_application(
-        self, application_id: int, operator: str
+        self, application_id: int, data: schemas.LeaveApplicationCancel
     ) -> LeaveApplication:
-        application = self.db.query(LeaveApplication).filter(
-            LeaveApplication.id == application_id
-        ).first()
-        if not application:
-            raise ValueError("申请单不存在")
+        with TransactionBoundary(self.db):
+            application = self.db.query(LeaveApplication).filter(
+                LeaveApplication.id == application_id
+            ).first()
+            if not application:
+                raise ValueError("申请单不存在")
 
-        if application.status not in ["pending"]:
-            raise ValueError(f"当前状态为 {application.status}，无法撤销")
+            if application.status not in ["pending"]:
+                raise ValueError(f"当前状态为 {application.status}，无法撤销")
 
-        application.status = "cancelled"
+            application.status = "cancelled"
+            application.cancelled_by = data.operator
+            application.cancelled_at = datetime.now()
+            application.cancel_reason = data.cancel_reason
 
-        approval_record = ApprovalRecord(
-            application_id=application.id,
-            approver=operator,
-            action="cancel",
-            comment="申请人撤销"
-        )
-        self.db.add(approval_record)
+            approval_record = ApprovalRecord(
+                application_id=application.id,
+                approver=data.operator,
+                action="cancel",
+                comment=data.cancel_reason or "申请人撤销"
+            )
+            self.db.add(approval_record)
 
+        unfreeze_ok = False
         try:
             self.balance_service.unfreeze_balance(
                 employee_id=application.employee_id,
                 leave_type_id=application.leave_type_id,
                 days=application.days,
-                year=application.start_date.year
+                year=application.start_date.year,
+                application_id=application.id,
+                operator=data.operator,
+                reason=f"撤销申请解冻: {application.application_no}"
             )
-        except Exception:
+            unfreeze_ok = True
+        except Exception as e:
             pass
 
-        self.db.commit()
+        if not unfreeze_ok:
+            try:
+                self.balance_service.unfreeze_balance(
+                    employee_id=application.employee_id,
+                    leave_type_id=application.leave_type_id,
+                    days=application.days,
+                    year=application.start_date.year,
+                    application_id=application.id,
+                    operator=data.operator,
+                    reason=f"撤销申请解冻(重试): {application.application_no}"
+                )
+            except Exception:
+                pass
+
+        self.db.refresh(application)
+        return application
+
+    def restore_application(
+        self, application_id: int, operator: str
+    ) -> LeaveApplication:
+        with TransactionBoundary(self.db):
+            application = self.db.query(LeaveApplication).filter(
+                LeaveApplication.id == application_id
+            ).first()
+            if not application:
+                raise ValueError("申请单不存在")
+
+            if application.status != "cancelled":
+                raise ValueError(f"当前状态为 {application.status}，仅已撤销申请可恢复")
+
+            leave_type = self.db.query(LeaveType).filter(
+                LeaveType.id == application.leave_type_id
+            ).first()
+            if not leave_type or not leave_type.is_active:
+                raise ValueError("假期类型已停用")
+
+        try:
+            self.balance_service.freeze_balance(
+                employee_id=application.employee_id,
+                leave_type_id=application.leave_type_id,
+                days=application.days,
+                year=application.start_date.year,
+                application_id=application.id,
+                operator=operator,
+                reason=f"恢复申请冻结: {application.application_no}"
+            )
+        except Exception as e:
+            raise ValueError(f"恢复申请失败：{str(e)}")
+
+        with TransactionBoundary(self.db):
+            app = self.db.query(LeaveApplication).filter(
+                LeaveApplication.id == application_id
+            ).first()
+            if app:
+                app.status = "pending"
+                app.cancelled_by = None
+                app.cancelled_at = None
+                app.cancel_reason = None
+
+                approval_record = ApprovalRecord(
+                    application_id=app.id,
+                    approver=operator,
+                    action="restore",
+                    comment=f"恢复已撤销申请"
+                )
+                self.db.add(approval_record)
+
         self.db.refresh(application)
         return application
 
     def get_application(self, application_id: int) -> Optional[LeaveApplication]:
-        return self.db.query(LeaveApplication).filter(
+        application = self.db.query(LeaveApplication).filter(
             LeaveApplication.id == application_id
         ).first()
+        if application and self.auth:
+            from app.services.permission_service import PermissionService
+            perm = PermissionService(self.db)
+            if not perm.can_view_employee(self.auth, application.employee_id):
+                raise PermissionError("无权限查看此申请")
+        return application
 
     def get_applications(
         self,
@@ -220,6 +362,8 @@ class ApplicationService:
             query = query.filter(LeaveApplication.start_date >= start_date)
         if end_date:
             query = query.filter(LeaveApplication.end_date <= end_date)
+
+        query = self._apply_permission_filter(query)
 
         total = query.count()
         applications = query.order_by(
