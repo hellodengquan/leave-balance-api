@@ -636,20 +636,501 @@ def test_8_freeze_rollback_chain():
     print("✓ 冻结恢复回滚链路测试通过")
 
 
+def test_9_hold_reapply_path():
+    print("\n" + "="*60)
+    print("测试 9: Hold Rejected 重新申请路径")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    sick_id = seed["lt_ids"][2]
+    service = BalanceService(db)
+
+    past_expire = date.today() - timedelta(days=10)
+    service.grant_leave(emp_id, sick_id, 5.0, "病假", "admin", 2024, expire_date=past_expire)
+    holds = service.scan_expired_and_create_holds(operator="system")
+    hold = next(h for h in holds if h.employee_id == emp_id)
+    print(f"✓ 创建Hold: {hold.hold_no}, status={hold.status}")
+
+    service.reject_expire_hold(hold.id, approver="HR", reject_reason="需要复核")
+    db.refresh(hold)
+    assert hold.status == "rejected"
+    print(f"✓ 驳回: status={hold.status}, reject_reason={hold.reject_reason}")
+
+    hold2 = service.reapply_expire_hold(hold.id, operator="员工", new_timeout_hours=48)
+    assert hold2.status == "pending"
+    assert hold2.reapply_count == 1
+    assert hold2.timeout_hours == 48
+    print(f"✓ 重新申请: status={hold2.status}, reapply_count={hold2.reapply_count}, "
+          f"timeout={hold2.timeout_hours}h")
+
+    total_approvals, approvals = service.list_expire_hold_approvals(hold_id=hold.id)
+    reapply_rec = [a for a in approvals if a.action == "reapply"]
+    assert len(reapply_rec) >= 1
+    print(f"✓ 审批记录: reapply 操作 {len(reapply_rec)} 条")
+
+    service.reject_expire_hold(hold.id, approver="HR2", reject_reason="再次驳回")
+    db.refresh(hold)
+    hold3 = service.reapply_expire_hold(hold.id, operator="员工")
+    assert hold3.reapply_count == 2
+    print(f"✓ 第2次重新申请: reapply_count={hold3.reapply_count}")
+
+    try:
+        service.reapply_expire_hold(hold.id, operator="员工")
+        assert False, "pending状态不应允许重新申请"
+    except ValueError as e:
+        print(f"✓ pending状态拒绝重申请: {e}")
+
+    db.close()
+    print("✓ Hold Reapply 测试通过")
+
+
+def test_10_recover_stuck_with_compensation():
+    print("\n" + "="*60)
+    print("测试 10: recover_stuck_holds 自动补偿")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    sick_id = seed["lt_ids"][2]
+    service = BalanceService(db)
+
+    past_expire = date.today() - timedelta(days=5)
+    service.grant_leave(emp_id, sick_id, 8.0, "病假", "admin", 2024, expire_date=past_expire)
+    holds = service.scan_expired_and_create_holds(operator="system")
+    hold = next(h for h in holds if h.employee_id == emp_id)
+    hold_txn_id = hold.transaction_id
+    print(f"✓ 创建Hold: {hold.hold_no}, 天数={hold.hold_days}, txn_id={hold_txn_id}")
+
+    acc = service._get_or_create_account(emp_id, sick_id, 2024)
+    original_pending = acc.pending_expire_days
+    original_balance = acc.balance
+    acc.pending_expire_days = 1.0
+    db.commit()
+    db.refresh(acc)
+    print(f"✓ 模拟数据不一致: pending从{original_pending}降到1.0 (余额{acc.balance})")
+
+    recovered = service.recover_stuck_holds(auto_compensate=True)
+    print(f"✓ 第一轮检测: {len(recovered)} 张stuck (余额非0不视为stuck)")
+    assert len(recovered) == 0
+
+    db.refresh(acc)
+    print(f"  补偿后: balance={acc.balance}, pending={acc.pending_expire_days}")
+    assert acc.pending_expire_days >= hold.hold_days, "pending应被修复到hold天数"
+    assert acc.balance == original_balance, "总余额不变（pending从可用转待过期）"
+
+    total_txns, txns = service.get_transactions(employee_id=emp_id, leave_type_id=sick_id,
+                                                  year=2024, change_type="compensate_add")
+    print(f"✓ 补偿交易: {total_txns} 条")
+    assert total_txns >= 1
+
+    print("---")
+
+    from app.models.models import LeaveTransaction
+    txn = db.query(LeaveTransaction).filter(
+        LeaveTransaction.id == hold_txn_id
+    ).first()
+    if txn:
+        db.delete(txn)
+        db.commit()
+        print(f"✓ 构造stuck: 删除关联交易 txn_id={hold_txn_id}")
+
+    recovered2 = service.recover_stuck_holds(auto_compensate=True)
+    print(f"✓ 第二轮检测: {len(recovered2)} 张stuck (关联交易不存在)")
+    assert len(recovered2) >= 1
+
+    stuck_hold = recovered2[0]
+    assert stuck_hold.is_stuck is True
+    assert stuck_hold.recovered_at is not None
+    assert stuck_hold.status == "rejected"
+    print(f"  is_stuck={stuck_hold.is_stuck}, status={stuck_hold.status}, "
+          f"reject_reason={stuck_hold.reject_reason}")
+
+    db.close()
+    print("✓ Stuck Hold自动补偿测试通过")
+
+
+def test_11_retro_chain_deep_truncate():
+    print("\n" + "="*60)
+    print("测试 11: Retro Chain 极深链截断与循环检测")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    annual_id = seed["lt_ids"][0]
+    service = BalanceService(db)
+
+    _, prev_txn = service.grant_leave(emp_id, annual_id, 10.0, "初始发放", "admin", 2024)
+
+    prev_id = prev_txn.id
+    for i in range(15):
+        from app.models.models import LeaveTransaction
+        new_txn = LeaveTransaction(
+            account_id=prev_txn.account_id,
+            leave_type_id=annual_id,
+            employee_id=emp_id,
+            year=2024,
+            change_type="adjust_add",
+            change_days=1.0,
+            balance_after=10.0 + i + 1,
+            frozen_after=0.0,
+            reason=f"补发层级-{i+1}",
+            operator="test",
+            related_transaction_id=prev_id
+        )
+        db.add(new_txn)
+        db.flush()
+        prev_id = new_txn.id
+    db.commit()
+
+    chain = service.get_retro_chain(prev_id, max_depth=5)
+    print(f"✓ max_depth=5: depth={chain.total_depth}, is_truncated={chain.is_truncated}")
+    assert chain.is_truncated is True
+    assert chain.total_depth == 5
+
+    chain_full = service.get_retro_chain(prev_id, max_depth=20)
+    print(f"✓ max_depth=20: depth={chain_full.total_depth}, is_truncated={chain_full.is_truncated}")
+    assert chain_full.is_truncated is False
+    assert chain_full.total_depth == 16
+
+    from app.models.models import LeaveTransaction as LT
+    txn_a = db.query(LT).filter(LT.reason == "补发层级-3").first()
+    txn_b = db.query(LT).filter(LT.reason == "补发层级-7").first()
+    if txn_a and txn_b:
+        txn_a.related_transaction_id = txn_b.id
+        db.commit()
+        print(f"✓ 构造环: txn#{txn_a.id}(层级3) → txn#{txn_b.id}(层级7)")
+
+        chain_cycle = service.get_retro_chain(prev_id, max_depth=20)
+        print(f"  has_cycle={chain_cycle.has_cycle}, cycle_start_id={chain_cycle.cycle_start_id}")
+        assert chain_cycle.has_cycle is True
+        assert chain_cycle.cycle_start_id == txn_b.id
+        print(f"✓ 循环检测: 正确识别环起点={chain_cycle.cycle_start_id}")
+
+    db.close()
+    print("✓ Retro Chain 深度截断与循环检测测试通过")
+
+
+def test_12_field_permission_runtime_toggle():
+    print("\n" + "="*60)
+    print("测试 12: FieldPermission 运行时切换（缓存、启停、优先级）")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    service = BalanceService(db)
+
+    service.set_field_permission("employee", "balance", "frozen_balance", "hidden", priority=10)
+    service.set_field_permission("employee", "balance", "employee_name", "masked", "name", priority=5)
+    print("✓ 初始化2条权限规则")
+
+    from app.utils import invalidate_field_perm_cache, get_field_perm_cache_ver
+    ver_before = get_field_perm_cache_ver()
+
+    service.set_field_permission("employee", "balance", "frozen_balance", "visible")
+    ver_after = get_field_perm_cache_ver()
+    print(f"✓ 修改权限后缓存版本: {ver_before} → {ver_after}")
+    assert ver_after > ver_before
+
+    service.toggle_field_permission("employee", "balance", "employee_name", False)
+    fps = service.get_field_permissions(role="employee", resource="balance")
+    active_fps = [f for f in fps if f.is_active]
+    print(f"✓ 停用name脱敏后: 激活规则数={len(active_fps)}")
+    assert len(active_fps) == 1
+
+    perm = PermissionService(db)
+    auth = perm.get_auth_context("zhangsan")
+    svc_emp = BalanceService(db, auth)
+
+    data = {
+        "employee_name": "张三丰",
+        "frozen_balance": 3.0,
+        "balance": 10.0,
+    }
+    result = svc_emp.apply_field_filter(data, "balance")
+    print(f"✓ 停用name脱敏后: employee_name={result.data.get('employee_name')}")
+    assert result.data.get("employee_name") == "张三丰"
+
+    service.toggle_field_permission("employee", "balance", "employee_name", True)
+    result2 = svc_emp.apply_field_filter(data, "balance")
+    print(f"✓ 启用name脱敏后: employee_name={result2.data.get('employee_name')}")
+    assert result2.data.get("employee_name") == "张**"
+
+    print("✓ 运行时切换即时生效")
+
+    db.close()
+    print("✓ FieldPermission 运行时切换测试通过")
+
+
+def test_13_cursor_secret_rotation():
+    print("\n" + "="*60)
+    print("测试 13: 游标签名密钥轮换（新旧兼容、轮换、停用）")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    annual_id = seed["lt_ids"][0]
+    service = BalanceService(db)
+
+    for i in range(15):
+        service.adjust_balance(emp_id, annual_id, 1.0, f"测试-{i+1}", "test", 2024)
+    print("✓ 生成15条交易")
+
+    page1 = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024, limit=5, include_total=False
+    )
+    cursor1 = page1.next_cursor
+    print(f"✓ 默认密钥生成cursor: {cursor1[:20]}...")
+
+    page2 = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024,
+        cursor=cursor1, limit=5
+    )
+    assert len(page2.items) == 5
+    print(f"✓ 默认密钥解码成功: 第2页{len(page2.items)}条")
+
+    new_secret = "new-rotation-secret-v2-test"
+    cs = service.rotate_cursor_secret(new_secret)
+    print(f"✓ 轮换新密钥: version={cs.version}, is_primary={cs.is_primary}")
+
+    page_new = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024, limit=5
+    )
+    cursor_new = page_new.next_cursor
+    print(f"✓ 新密钥生成cursor: {cursor_new[:20]}...")
+    assert cursor_new != cursor1
+
+    page_old_cursor = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024,
+        cursor=cursor1, limit=5
+    )
+    print(f"✓ 旧cursor仍然兼容: 第2页{len(page_old_cursor.items)}条")
+    assert len(page_old_cursor.items) == 5
+
+    page_new_cursor = service.get_transactions_cursor(
+        employee_id=emp_id, leave_type_id=annual_id, year=2024,
+        cursor=cursor_new, limit=5
+    )
+    assert len(page_new_cursor.items) == 5
+    print(f"✓ 新cursor正常使用: 第2页{len(page_new_cursor.items)}条")
+
+    secrets = service.list_cursor_secrets()
+    print(f"✓ 密钥列表: {len(secrets)} 个, 版本={[s.version for s in secrets]}")
+    assert len(secrets) >= 1
+    assert secrets[0].is_primary is True
+    assert secrets[0].secret_key != "default-cursor-secret-key"
+
+    old_primary = [s for s in secrets if not s.is_primary and s.is_active]
+    if old_primary:
+        try:
+            service.deactivate_cursor_secret(old_primary[0].id)
+            print(f"✓ 停用旧密钥: id={old_primary[0].id}")
+        except ValueError as e:
+            print(f"  停用提示: {e}")
+
+    db.close()
+    print("✓ 游标密钥轮换测试通过")
+
+
+def test_14_rollback_chain_cycle_detection():
+    print("\n" + "="*60)
+    print("测试 14: Rollback 链环检测（循环检测、断裂、路径）")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    annual_id = seed["lt_ids"][0]
+    service = BalanceService(db)
+    app_service = ApplicationService(db)
+
+    service.grant_leave(emp_id, annual_id, 10.0, "初始", "admin", 2024)
+
+    app_data = schemas.LeaveApplicationCreate(
+        employee_id=emp_id, leave_type_id=annual_id,
+        start_date=date(2024, 9, 1), end_date=date(2024, 9, 2), days=2.0,
+        reason="测试"
+    )
+    app = app_service.create_application(app_data)
+    cancel_data = schemas.LeaveApplicationCancel(operator="test", cancel_reason="取消")
+    app2 = app_service.cancel_application(app.id, cancel_data)
+    app3 = app_service.restore_application(app.id, operator="test")
+    print(f"✓ 构造3步链路: freeze→unfreeze→restore_freeze")
+
+    result = service.check_freeze_rollback_cycle(application_id=app.id)
+    print(f"  has_cycle={result['has_cycle']}, depth={result['total_depth']}, "
+          f"path={result['cycle_path']}")
+    assert result["has_cycle"] is False
+
+    _, logs = service.get_frozen_logs(application_id=app.id)
+    freeze_logs = [l for l in logs if l.operation == "freeze"]
+    unfreeze_logs = [l for l in logs if l.operation == "unfreeze"]
+    if freeze_logs and unfreeze_logs:
+        first_freeze = freeze_logs[0]
+        last_freeze = freeze_logs[-1]
+        if first_freeze.id != last_freeze.id:
+            first_freeze.rollback_of_id = last_freeze.id
+            db.commit()
+            print(f"✓ 构造环: log#{first_freeze.id} → log#{last_freeze.id}")
+
+            result2 = service.check_freeze_rollback_cycle(
+                start_log_id=first_freeze.id, max_depth=20
+            )
+            print(f"  has_cycle={result2['has_cycle']}, cycle_start={result2['cycle_start_id']}")
+            assert result2["has_cycle"] is True
+
+            broken = service.break_freeze_rollback_cycle(first_freeze.id)
+            assert broken.rollback_of_id is None
+            assert "[环断裂]" in (broken.reason or "")
+            print(f"✓ 环断裂: log#{broken.id} rollback_of_id={broken.rollback_of_id}")
+
+            result3 = service.check_freeze_rollback_cycle(
+                start_log_id=last_freeze.id, max_depth=20
+            )
+            print(f"  断裂后has_cycle={result3['has_cycle']}")
+            assert result3["has_cycle"] is False
+
+    db.close()
+    print("✓ Rollback链环检测测试通过")
+
+
+def test_15_hr_scenario_masking():
+    print("\n" + "="*60)
+    print("测试 15: HR 全量场景脱敏（总监级员工额外脱敏）")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    annual_id = seed["lt_ids"][0]
+
+    master = MasterDataService(db)
+    director_emp = master.create_employee(schemas.EmployeeCreate(
+        employee_no="DIR001", name="王总监", department="技术部",
+        position="技术总监", hire_date=date(2018, 1, 1)
+    ))
+    print(f"✓ 创建总监员工: {director_emp.name}, position={director_emp.position}")
+
+    service = BalanceService(db)
+    service.grant_leave(director_emp.id, annual_id, 20.0, "总监年假", "admin", 2024)
+
+    perm = PermissionService(db)
+    auth_hr = perm.get_auth_context("hr1")
+    svc_hr = BalanceService(db, auth_hr)
+
+    data_normal = {
+        "employee_id": emp_id,
+        "employee_name": "张三",
+        "balance": 10.0,
+        "frozen_balance": 3.0,
+    }
+    result_normal = svc_hr.apply_field_filter(
+        data_normal, "balance", target_employee_id=emp_id
+    )
+    print(f"✓ HR查普通员工: name={result_normal.data.get('employee_name')}, "
+          f"frozen={result_normal.data.get('frozen_balance')}")
+    assert result_normal.data.get("employee_name") == "张三"
+    assert result_normal.data.get("frozen_balance") == 3.0
+
+    data_dir = {
+        "employee_id": director_emp.id,
+        "employee_name": "王总监",
+        "balance": 20.0,
+        "frozen_balance": 5.0,
+    }
+    result_dir = svc_hr.apply_field_filter(
+        data_dir, "balance", target_employee_id=director_emp.id
+    )
+    print(f"✓ HR查总监: name={result_dir.data.get('employee_name')}, "
+          f"frozen={result_dir.data.get('frozen_balance')}")
+    assert result_dir.data.get("employee_name") == "王**"
+    assert "frozen_balance" in result_dir.hidden_fields
+    assert result_dir.data.get("frozen_balance") is None
+
+    print("✓ 场景化脱敏: 总监级额外脱敏生效")
+
+    db.close()
+    print("✓ HR场景脱敏测试通过")
+
+
+def test_16_masking_audit_trail():
+    print("\n" + "="*60)
+    print("测试 16: 脱敏审计旁路（操作留痕、溯源查询）")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    service = BalanceService(db)
+
+    service.set_field_permission("employee", "balance", "frozen_balance", "hidden")
+    service.set_field_permission("employee", "balance", "employee_name", "masked", "name")
+
+    perm = PermissionService(db)
+    auth_emp = perm.get_auth_context("zhangsan")
+    svc_emp = BalanceService(db, auth_emp)
+
+    data = {
+        "employee_id": emp_id,
+        "employee_name": "张三丰",
+        "balance": 10.0,
+        "frozen_balance": 3.0,
+    }
+    result = svc_emp.apply_field_filter(
+        data, "balance", target_employee_id=emp_id, enable_audit=True
+    )
+    print(f"✓ 执行脱敏: hidden={result.hidden_fields}, masked={result.masked_fields}")
+
+    total, logs = service.get_field_audit_logs(operator="zhangsan")
+    print(f"✓ 审计日志: {total} 条")
+    assert total >= 2
+
+    for log in logs[:5]:
+        print(f"  - {log.created_at.strftime('%H:%M:%S')} {log.field_name}: "
+              f"{log.access_type}, original={log.original_value}, masked={log.masked_value}")
+
+    name_logs = [l for l in logs if l.field_name == "employee_name" and l.access_type == "masked"]
+    assert len(name_logs) >= 1
+    nl = name_logs[0]
+    assert nl.original_value == "张三丰"
+    assert nl.masked_value == "张**"
+    assert nl.mask_pattern == "name"
+    assert nl.target_employee_id == emp_id
+    print(f"✓ 脱敏溯源: 原值={nl.original_value} → 脱敏值={nl.masked_value}, "
+          f"模式={nl.mask_pattern}, request_id={nl.request_id}")
+
+    hidden_logs = [l for l in logs if l.field_name == "frozen_balance" and l.access_type == "hidden"]
+    assert len(hidden_logs) >= 1
+    print(f"✓ 隐藏审计: {len(hidden_logs)} 条, 原值={hidden_logs[0].original_value}")
+
+    result_no_audit = svc_emp.apply_field_filter(
+        data, "balance", target_employee_id=emp_id, enable_audit=False
+    )
+    total2, _ = service.get_field_audit_logs(operator="zhangsan")
+    print(f"✓ 关闭审计后日志不增长: {total} → {total2}")
+
+    db.close()
+    print("✓ 脱敏审计旁路测试通过")
+
+
 def run_all_tests():
     print("\n" + "#"*60)
-    print("#  员工假期余额管理API - 补充8大特性测试")
+    print("#  员工假期余额管理API - 第三批8大特性测试")
     print("#"*60)
 
     test_funcs = [
-        test_1_cursor_stability,
-        test_2_optimistic_lock_concurrent,
-        test_3_holiday_substitute,
-        test_4_hold_fallback,
-        test_5_retro_chain_ui,
-        test_6_cursor_large_data,
-        test_7_field_level_permission,
-        test_8_freeze_rollback_chain,
+        test_9_hold_reapply_path,
+        test_10_recover_stuck_with_compensation,
+        test_11_retro_chain_deep_truncate,
+        test_12_field_permission_runtime_toggle,
+        test_13_cursor_secret_rotation,
+        test_14_rollback_chain_cycle_detection,
+        test_15_hr_scenario_masking,
+        test_16_masking_audit_trail,
     ]
 
     passed = 0
@@ -667,7 +1148,7 @@ def run_all_tests():
     print("\n" + "#"*60)
     print(f"#  测试结果: 通过 {passed}, 失败 {failed}")
     if failed == 0:
-        print("#  ✓ 全部补充特性测试通过！")
+        print("#  ✓ 全部第三批特性测试通过！")
     print("#"*60 + "\n")
     return failed == 0
 

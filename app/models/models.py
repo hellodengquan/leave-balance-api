@@ -75,6 +75,10 @@ class ExpireHold(Base):
     operator = Column(String(100))
     timeout_hours = Column(Integer, default=72)
     escalated_to = Column(String(100))
+    reapply_count = Column(Integer, default=0)
+    last_reapplied_at = Column(DateTime, nullable=True)
+    is_stuck = Column(Boolean, default=False)
+    recovered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -124,11 +128,43 @@ class FieldPermission(Base):
     field_name = Column(String(100), nullable=False)
     access = Column(String(20), default="visible", nullable=False)
     mask_pattern = Column(String(100), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    priority = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
         UniqueConstraint("role", "resource", "field_name", name="uix_role_resource_field"),
     )
+
+
+class CursorSecret(Base):
+    __tablename__ = "cursor_secrets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    secret_key = Column(String(200), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_primary = Column(Boolean, default=False, nullable=False)
+    version = Column(Integer, default=1, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    expires_at = Column(DateTime, nullable=True)
+
+
+class FieldAuditLog(Base):
+    __tablename__ = "field_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    operator = Column(String(100), nullable=False, index=True)
+    operator_role = Column(String(50), nullable=False)
+    resource = Column(String(50), nullable=False, index=True)
+    field_name = Column(String(100), nullable=False, index=True)
+    target_employee_id = Column(Integer, nullable=True, index=True)
+    original_value = Column(Text, nullable=True)
+    masked_value = Column(Text, nullable=True)
+    mask_pattern = Column(String(100), nullable=True)
+    access_type = Column(String(20), default="masked", nullable=False)
+    request_id = Column(String(100), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class Employee(Base):

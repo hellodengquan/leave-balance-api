@@ -152,6 +152,9 @@ class RetroLinkChain(BaseModel):
     grant_transaction_id: int
     chain: List[RetroLinkChainNode]
     total_depth: int
+    has_cycle: bool = False
+    is_truncated: bool = False
+    cycle_start_id: Optional[int] = None
 
 
 class FieldPermissionBase(BaseModel):

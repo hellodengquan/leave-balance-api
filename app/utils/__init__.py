@@ -2,9 +2,10 @@ import time
 import random
 import hashlib
 import logging
+import uuid
 from functools import wraps
-from typing import Callable, Any, Type, Tuple, Set, Optional
-from datetime import date, timedelta
+from typing import Callable, Any, Type, Tuple, Set, Optional, Dict, List
+from datetime import date, timedelta, datetime
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -13,6 +14,11 @@ logger = logging.getLogger(__name__)
 CONCURRENCY_ERRORS: Tuple[Type[Exception], ...] = (ValueError,)
 
 CURSOR_SECRET = "leave-balance-cursor-v1"
+
+_field_perm_cache: Dict[str, List] = {}
+_field_perm_cache_ver: int = 0
+_field_perm_cache_ts: Optional[float] = None
+_field_perm_cache_ttl: float = 60.0
 
 
 class TransactionBoundary:
@@ -145,36 +151,73 @@ def add_workdays(d: date, days: int, holidays: set = None, workdays: set = None)
     return current
 
 
-def encode_cursor(txn_id: int, sort_key: str = "id_desc") -> str:
+def encode_cursor(txn_id: int, sort_key: str = "id_desc", secret: Optional[str] = None) -> str:
     import base64, json
     payload = {"id": txn_id, "sk": sort_key}
     raw = json.dumps(payload, separators=(",", ":")).encode()
-    sig = hashlib.sha256(raw + CURSOR_SECRET.encode()).hexdigest()[:8]
+    sec = secret or CURSOR_SECRET
+    sig = hashlib.sha256(raw + sec.encode()).hexdigest()[:8]
     data = {"p": payload, "s": sig}
     return base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).decode()
 
 
-def decode_cursor(cursor: str) -> Tuple[Optional[int], Optional[str]]:
+def decode_cursor(cursor: str, secrets: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str]]:
     import base64, json
     try:
         data = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
         payload = data.get("p", {})
         sig = data.get("s", "")
-        expected_sig = hashlib.sha256(
-            json.dumps(payload, separators=(",", ":")).encode() + CURSOR_SECRET.encode()
-        ).hexdigest()[:8]
-        if sig != expected_sig:
-            return None, None
-        return payload.get("id"), payload.get("sk", "id_desc")
+        sec_list = secrets if secrets else [CURSOR_SECRET]
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        for sec in sec_list:
+            expected_sig = hashlib.sha256(raw + sec.encode()).hexdigest()[:8]
+            if sig == expected_sig:
+                return payload.get("id"), payload.get("sk", "id_desc")
+        return None, None
     except Exception:
         return None, None
+
+
+def invalidate_field_perm_cache():
+    global _field_perm_cache_ver, _field_perm_cache_ts
+    _field_perm_cache_ver += 1
+    _field_perm_cache_ts = None
+
+
+def get_field_perm_cache_ver() -> int:
+    return _field_perm_cache_ver
+
+
+def _field_perm_cache_key(role: str, resource: str) -> str:
+    return f"{role}:{resource}"
+
+
+def get_cached_field_perms(role: str, resource: str) -> Optional[List]:
+    if _field_perm_cache_ts is None:
+        return None
+    age = time.time() - _field_perm_cache_ts
+    if age > _field_perm_cache_ttl:
+        return None
+    key = _field_perm_cache_key(role, resource)
+    return _field_perm_cache.get(key)
+
+
+def set_cached_field_perms(role: str, resource: str, perms: List):
+    key = _field_perm_cache_key(role, resource)
+    _field_perm_cache[key] = perms
+    global _field_perm_cache_ts
+    if _field_perm_cache_ts is None:
+        _field_perm_cache_ts = time.time()
 
 
 def apply_field_permissions(
     data: dict,
     role: str,
     resource: str,
-    field_permissions: list
+    field_permissions: list,
+    audit_callback: Optional[Callable] = None,
+    operator: Optional[str] = None,
+    target_employee_id: Optional[int] = None,
 ) -> Tuple[dict, list, list]:
     masked_fields = []
     hidden_fields = []
@@ -182,21 +225,44 @@ def apply_field_permissions(
     for fp in field_permissions:
         if fp.role != role or fp.resource != resource:
             continue
+        if not getattr(fp, "is_active", True):
+            continue
         field = fp.field_name
         if field not in data:
             continue
         if fp.access == "hidden":
             hidden_fields.append(field)
+            if audit_callback:
+                try:
+                    audit_callback(
+                        operator=operator, role=role, resource=resource,
+                        field=field, original=str(data[field]),
+                        masked=None, pattern=None, access_type="hidden",
+                        target_employee_id=target_employee_id
+                    )
+                except Exception:
+                    pass
             continue
         if fp.access == "masked" and fp.mask_pattern:
             masked_fields.append(field)
             val = str(data[field])
             if fp.mask_pattern == "name":
-                result[field] = val[0] + "**" if len(val) > 1 else val
+                masked_val = val[0] + "**" if len(val) > 1 else val
             elif fp.mask_pattern == "partial":
-                result[field] = val[:2] + "***" + val[-2:] if len(val) > 4 else "***"
+                masked_val = val[:2] + "***" + val[-2:] if len(val) > 4 else "***"
             else:
-                result[field] = fp.mask_pattern
+                masked_val = fp.mask_pattern
+            result[field] = masked_val
+            if audit_callback:
+                try:
+                    audit_callback(
+                        operator=operator, role=role, resource=resource,
+                        field=field, original=val,
+                        masked=masked_val, pattern=fp.mask_pattern,
+                        access_type="masked", target_employee_id=target_employee_id
+                    )
+                except Exception:
+                    pass
             continue
     for k, v in data.items():
         if k not in hidden_fields and k not in masked_fields:

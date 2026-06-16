@@ -9,13 +9,14 @@ from app.models.models import (
     Employee, LeaveType, LeaveAccount, LeaveTransaction,
     LeaveApplication, HolidayConfig, FrozenBalanceLog,
     ExpireHold, ExpireHoldApproval, GrantRetroLink, SysUser,
-    FieldPermission
+    FieldPermission, CursorSecret, FieldAuditLog
 )
 from app.schemas import schemas
 from app.utils import (
     TransactionBoundary, transactional, with_retry,
     is_workday, count_workdays, encode_cursor, decode_cursor,
-    apply_field_permissions
+    apply_field_permissions, invalidate_field_perm_cache,
+    get_cached_field_perms, set_cached_field_perms
 )
 
 
@@ -903,6 +904,19 @@ class BalanceService:
         items = query.order_by(ExpireHold.created_at.desc()).offset(skip).limit(limit).all()
         return total, items
 
+    def list_expire_hold_approvals(
+        self,
+        hold_id: Optional[int] = None,
+        skip: int = 0,
+        limit: int = 100
+    ) -> Tuple[int, List[ExpireHoldApproval]]:
+        query = self.db.query(ExpireHoldApproval)
+        if hold_id:
+            query = query.filter(ExpireHoldApproval.hold_id == hold_id)
+        total = query.count()
+        items = query.order_by(ExpireHoldApproval.created_at.desc()).offset(skip).limit(limit).all()
+        return total, items
+
     def get_balance(
         self,
         employee_id: Optional[int] = None,
@@ -1201,16 +1215,521 @@ class BalanceService:
         return fp
 
     def apply_field_filter(
-        self, data: dict, resource: str
+        self, data: dict, resource: str,
+        target_employee_id: Optional[int] = None,
+        enable_audit: bool = True
     ) -> schemas.FieldFilteredResponse:
         if not self.auth:
             return schemas.FieldFilteredResponse(data=data)
-        fps = self.get_field_permissions(role=self.auth.role, resource=resource)
-        if not fps:
+
+        extra_perms = self._get_scenario_permissions(resource, target_employee_id)
+
+        fps = self._get_effective_field_perms(self.auth.role, resource)
+        all_fps = list(fps) + extra_perms
+
+        if not all_fps:
             return schemas.FieldFilteredResponse(data=data)
+
+        audit_cb = None
+        if enable_audit and self.auth:
+            def _audit(**kwargs):
+                try:
+                    self._record_field_audit(
+                        operator=kwargs.get("operator") or self.auth.username,
+                        role=kwargs.get("role") or self.auth.role,
+                        resource=resource,
+                        field=kwargs.get("field"),
+                        original=kwargs.get("original"),
+                        masked=kwargs.get("masked"),
+                        pattern=kwargs.get("pattern"),
+                        access_type=kwargs.get("access_type"),
+                        target_employee_id=target_employee_id
+                    )
+                except Exception:
+                    pass
+            audit_cb = _audit
+
         filtered, masked, hidden = apply_field_permissions(
-            data, self.auth.role, resource, fps
+            data, self.auth.role, resource, all_fps,
+            audit_callback=audit_cb,
+            operator=self.auth.username if self.auth else None,
+            target_employee_id=target_employee_id
         )
         return schemas.FieldFilteredResponse(
             data=filtered, masked_fields=masked, hidden_fields=hidden
         )
+
+    def reapply_expire_hold(self, hold_id: int, operator: str,
+                             new_timeout_hours: Optional[int] = None) -> ExpireHold:
+        hold = self.db.query(ExpireHold).filter(ExpireHold.id == hold_id).first()
+        if not hold:
+            raise ValueError("Hold单不存在")
+        if hold.status not in ["rejected", "expired"]:
+            raise ValueError(f"当前状态为 {hold.status}，不可重新申请")
+
+        hold.status = "pending"
+        hold.approver = None
+        hold.approved_at = None
+        hold.reject_reason = None
+        hold.reapply_count = (hold.reapply_count or 0) + 1
+        hold.last_reapplied_at = datetime.now()
+        if new_timeout_hours is not None:
+            hold.timeout_hours = new_timeout_hours
+
+        approval = ExpireHoldApproval(
+            hold_id=hold.id, approver=operator,
+            action="reapply", comment=f"第{hold.reapply_count}次重新申请"
+        )
+        self.db.add(approval)
+        self.db.commit()
+        self.db.refresh(hold)
+        return hold
+
+    def recover_stuck_holds(self, auto_compensate: bool = True) -> List[ExpireHold]:
+        stuck = self.db.query(ExpireHold).filter(
+            ExpireHold.status == "pending"
+        ).all()
+        recovered = []
+        for hold in stuck:
+            is_stuck = False
+            reject_reason = None
+
+            account = self.db.query(LeaveAccount).filter(
+                LeaveAccount.id == hold.account_id
+            ).first()
+            if not account:
+                is_stuck = True
+                reject_reason = "账户不存在，自动关闭"
+            else:
+                txn = self.db.query(LeaveTransaction).filter(
+                    LeaveTransaction.id == hold.transaction_id
+                ).first()
+                if not txn:
+                    is_stuck = True
+                    reject_reason = "关联交易不存在，自动关闭"
+
+                if auto_compensate and account.pending_expire_days < hold.hold_days:
+                    gap = hold.hold_days - account.pending_expire_days
+                    if gap > 0 and account.balance >= gap:
+                        account.pending_expire_days += gap
+                        comp_txn = self._create_transaction(
+                            account=account,
+                            leave_type_id=hold.leave_type_id,
+                            employee_id=hold.employee_id,
+                            year=account.year,
+                            change_type="compensate_add",
+                            change_days=gap,
+                            reason=f"Hold恢复补偿: {hold.hold_no}",
+                            operator="system_recovery",
+                            source_id=str(hold.hold_no),
+                            source_type="hold_recovery",
+                            related_transaction_id=hold.transaction_id if txn else None
+                        )
+                        self.db.add(comp_txn)
+
+                if account.balance <= 0 and account.pending_expire_days <= 0:
+                    is_stuck = True
+                    reject_reason = "余额已为零，自动关闭"
+
+            if is_stuck:
+                hold.status = "rejected"
+                hold.reject_reason = reject_reason
+                hold.is_stuck = True
+                hold.recovered_at = datetime.now()
+                recovered.append(hold)
+
+        if recovered:
+            self.db.commit()
+            for h in recovered:
+                self.db.refresh(h)
+        elif auto_compensate:
+            self.db.commit()
+        return recovered
+
+    def get_retro_chain(
+        self, grant_transaction_id: int, max_depth: int = 10
+    ) -> schemas.RetroLinkChain:
+        chain = []
+        visited = set()
+        current_txn_id = grant_transaction_id
+        has_cycle = False
+        is_truncated = False
+        cycle_start_id = None
+
+        for depth in range(max_depth):
+            if current_txn_id is None:
+                break
+            if current_txn_id in visited:
+                has_cycle = True
+                cycle_start_id = current_txn_id
+                break
+            visited.add(current_txn_id)
+
+            txn = self.db.query(LeaveTransaction).filter(
+                LeaveTransaction.id == current_txn_id
+            ).first()
+            if not txn:
+                break
+
+            retro = self.db.query(GrantRetroLink).filter(
+                GrantRetroLink.grant_transaction_id == current_txn_id
+            ).first()
+
+            app_no = None
+            app_id = None
+            if retro and retro.source_application_id:
+                app = self.db.query(LeaveApplication).filter(
+                    LeaveApplication.id == retro.source_application_id
+                ).first()
+                if app:
+                    app_id = app.id
+                    app_no = app.application_no
+
+            node = schemas.RetroLinkChainNode(
+                transaction_id=txn.id,
+                change_type=txn.change_type,
+                change_days=txn.change_days,
+                reason=txn.reason,
+                operator=txn.operator,
+                created_at=txn.created_at,
+                retro_link=retro,
+                related_application_id=app_id,
+                related_application_no=app_no
+            )
+            chain.append(node)
+
+            next_id = None
+            if txn.related_transaction_id:
+                next_id = txn.related_transaction_id
+            elif retro and retro.source_transaction_id:
+                next_id = retro.source_transaction_id
+
+            if next_id is None:
+                break
+            current_txn_id = next_id
+
+            if depth == max_depth - 1 and next_id is not None:
+                is_truncated = True
+
+        return schemas.RetroLinkChain(
+            grant_transaction_id=grant_transaction_id,
+            chain=chain,
+            total_depth=len(chain),
+            has_cycle=has_cycle,
+            is_truncated=is_truncated,
+            cycle_start_id=cycle_start_id
+        )
+
+    def _get_effective_field_perms(self, role: str, resource: str) -> List[FieldPermission]:
+        cached = get_cached_field_perms(role, resource)
+        if cached is not None:
+            return cached
+        perms = self.db.query(FieldPermission).filter(
+            FieldPermission.role == role,
+            FieldPermission.resource == resource,
+            FieldPermission.is_active == True
+        ).order_by(FieldPermission.priority.desc()).all()
+        set_cached_field_perms(role, resource, perms)
+        return perms
+
+    def set_field_permission(
+        self, role: str, resource: str, field_name: str,
+        access: str = "visible", mask_pattern: Optional[str] = None,
+        is_active: bool = True, priority: int = 0
+    ) -> FieldPermission:
+        existing = self.db.query(FieldPermission).filter(
+            FieldPermission.role == role,
+            FieldPermission.resource == resource,
+            FieldPermission.field_name == field_name
+        ).first()
+        if existing:
+            existing.access = access
+            existing.mask_pattern = mask_pattern
+            existing.is_active = is_active
+            existing.priority = priority
+            self.db.commit()
+            self.db.refresh(existing)
+        else:
+            fp = FieldPermission(
+                role=role, resource=resource, field_name=field_name,
+                access=access, mask_pattern=mask_pattern,
+                is_active=is_active, priority=priority
+            )
+            self.db.add(fp)
+            self.db.commit()
+            self.db.refresh(fp)
+            existing = fp
+        invalidate_field_perm_cache()
+        return existing
+
+    def toggle_field_permission(
+        self, role: str, resource: str, field_name: str, is_active: bool
+    ) -> FieldPermission:
+        fp = self.db.query(FieldPermission).filter(
+            FieldPermission.role == role,
+            FieldPermission.resource == resource,
+            FieldPermission.field_name == field_name
+        ).first()
+        if not fp:
+            raise ValueError("字段权限不存在")
+        fp.is_active = is_active
+        self.db.commit()
+        self.db.refresh(fp)
+        invalidate_field_perm_cache()
+        return fp
+
+    def _get_scenario_permissions(
+        self, resource: str, target_employee_id: Optional[int]
+    ) -> List[Any]:
+        if not self.auth or target_employee_id is None:
+            return []
+
+        if self.auth.role == "hr" and resource == "balance":
+            target_emp = self.db.query(Employee).filter(
+                Employee.id == target_employee_id
+            ).first()
+            if target_emp and target_emp.position and "总监" in target_emp.position:
+                class _TempPerm:
+                    def __init__(self, role, resource, field_name, access, mask_pattern):
+                        self.role = role
+                        self.resource = resource
+                        self.field_name = field_name
+                        self.access = access
+                        self.mask_pattern = mask_pattern
+                        self.is_active = True
+                        self.priority = 100
+                return [
+                    _TempPerm("hr", "balance", "employee_name", "masked", "name"),
+                    _TempPerm("hr", "balance", "frozen_balance", "hidden", None),
+                ]
+        return []
+
+    def _record_field_audit(
+        self, operator: str, role: str, resource: str, field: str,
+        original: Optional[str], masked: Optional[str],
+        pattern: Optional[str], access_type: str,
+        target_employee_id: Optional[int] = None
+    ):
+        import uuid as _uuid
+        log = FieldAuditLog(
+            operator=operator,
+            operator_role=role,
+            resource=resource,
+            field_name=field,
+            target_employee_id=target_employee_id,
+            original_value=original,
+            masked_value=masked,
+            mask_pattern=pattern,
+            access_type=access_type,
+            request_id=str(_uuid.uuid4())[:8]
+        )
+        self.db.add(log)
+        self.db.commit()
+
+    def get_field_audit_logs(
+        self, operator: Optional[str] = None,
+        resource: Optional[str] = None,
+        field_name: Optional[str] = None,
+        target_employee_id: Optional[int] = None,
+        skip: int = 0, limit: int = 100
+    ) -> Tuple[int, List[FieldAuditLog]]:
+        query = self.db.query(FieldAuditLog)
+        if operator:
+            query = query.filter(FieldAuditLog.operator == operator)
+        if resource:
+            query = query.filter(FieldAuditLog.resource == resource)
+        if field_name:
+            query = query.filter(FieldAuditLog.field_name == field_name)
+        if target_employee_id:
+            query = query.filter(FieldAuditLog.target_employee_id == target_employee_id)
+        total = query.count()
+        logs = query.order_by(FieldAuditLog.created_at.desc()).offset(skip).limit(limit).all()
+        return total, logs
+
+    def _get_active_cursor_secrets(self) -> List[str]:
+        secrets = self.db.query(CursorSecret).filter(
+            CursorSecret.is_active == True
+        ).order_by(CursorSecret.is_primary.desc(), CursorSecret.version.desc()).all()
+        keys = [s.secret_key for s in secrets]
+        from app.utils import CURSOR_SECRET
+        if CURSOR_SECRET not in keys:
+            keys.append(CURSOR_SECRET)
+        return keys
+
+    def _get_primary_cursor_secret(self) -> str:
+        primary = self.db.query(CursorSecret).filter(
+            CursorSecret.is_active == True,
+            CursorSecret.is_primary == True
+        ).first()
+        if primary:
+            return primary.secret_key
+        from app.utils import CURSOR_SECRET
+        return CURSOR_SECRET
+
+    def rotate_cursor_secret(self, new_secret: str) -> CursorSecret:
+        old_primary = self.db.query(CursorSecret).filter(
+            CursorSecret.is_active == True,
+            CursorSecret.is_primary == True
+        ).first()
+
+        max_ver = self.db.query(func.max(CursorSecret.version)).scalar() or 0
+        new_cs = CursorSecret(
+            secret_key=new_secret,
+            is_active=True,
+            is_primary=True,
+            version=max_ver + 1
+        )
+        self.db.add(new_cs)
+
+        if old_primary:
+            old_primary.is_primary = False
+
+        self.db.commit()
+        self.db.refresh(new_cs)
+        return new_cs
+
+    def list_cursor_secrets(self) -> List[CursorSecret]:
+        return self.db.query(CursorSecret).order_by(CursorSecret.version.desc()).all()
+
+    def deactivate_cursor_secret(self, secret_id: int) -> CursorSecret:
+        cs = self.db.query(CursorSecret).filter(CursorSecret.id == secret_id).first()
+        if not cs:
+            raise ValueError("密钥不存在")
+        if cs.is_primary:
+            raise ValueError("不能停用主密钥")
+        cs.is_active = False
+        self.db.commit()
+        self.db.refresh(cs)
+        return cs
+
+    def get_transactions_cursor(
+        self,
+        employee_id: Optional[int] = None,
+        leave_type_id: Optional[int] = None,
+        year: Optional[int] = None,
+        change_type: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        source_id: Optional[str] = None,
+        cursor: Optional[str] = None,
+        limit: int = 100,
+        include_total: bool = True
+    ) -> schemas.KeysetPaginatedResponse:
+        query = self.db.query(LeaveTransaction)
+
+        if employee_id:
+            query = query.filter(LeaveTransaction.employee_id == employee_id)
+        if leave_type_id:
+            query = query.filter(LeaveTransaction.leave_type_id == leave_type_id)
+        if year:
+            query = query.filter(LeaveTransaction.year == year)
+        if change_type:
+            query = query.filter(LeaveTransaction.change_type == change_type)
+        if start_date:
+            query = query.filter(LeaveTransaction.created_at >= datetime.combine(start_date, datetime.min.time()))
+        if end_date:
+            query = query.filter(LeaveTransaction.created_at <= datetime.combine(end_date, datetime.max.time()))
+        if source_id:
+            query = query.filter(LeaveTransaction.source_id == source_id)
+
+        query = self._apply_permission_filter(query, LeaveTransaction)
+
+        sort_key = "id_desc"
+        if cursor:
+            secrets = self._get_active_cursor_secrets()
+            cursor_id, cursor_sk = decode_cursor(cursor, secrets=secrets)
+            if cursor_id is None:
+                raise ValueError("无效或已篡改的游标")
+            sort_key = cursor_sk or "id_desc"
+            query = query.filter(LeaveTransaction.id < cursor_id)
+
+        total_count = None
+        if include_total:
+            total_count = query.count()
+
+        page_query = query.order_by(
+            LeaveTransaction.id.desc()
+        ).limit(limit + 1)
+
+        items = page_query.all()
+        has_more = len(items) > limit
+        if has_more:
+            items = items[:limit]
+
+        next_cursor = None
+        if items and has_more:
+            last = items[-1]
+            primary_secret = self._get_primary_cursor_secret()
+            next_cursor = encode_cursor(last.id, sort_key, secret=primary_secret)
+
+        return schemas.KeysetPaginatedResponse(
+            items=items,
+            next_cursor=next_cursor,
+            has_more=has_more,
+            total_count=total_count
+        )
+
+    def check_freeze_rollback_cycle(
+        self, application_id: Optional[int] = None,
+        start_log_id: Optional[int] = None,
+        max_depth: int = 50
+    ) -> Dict[str, Any]:
+        start_id = start_log_id
+        if application_id and not start_id:
+            first_log = self.db.query(FrozenBalanceLog).filter(
+                FrozenBalanceLog.application_id == application_id
+            ).order_by(FrozenBalanceLog.id.asc()).first()
+            if first_log:
+                start_id = first_log.id
+
+        if not start_id:
+            return {"has_cycle": False, "cycle_path": [], "total_depth": 0}
+
+        visited = set()
+        path = []
+        current_id = start_id
+        has_cycle = False
+        cycle_start = None
+
+        for _ in range(max_depth):
+            if current_id is None:
+                break
+            if current_id in visited:
+                has_cycle = True
+                cycle_start = current_id
+                break
+            visited.add(current_id)
+
+            log = self.db.query(FrozenBalanceLog).filter(
+                FrozenBalanceLog.id == current_id
+            ).first()
+            if not log:
+                break
+            path.append(current_id)
+
+            next_log = self.db.query(FrozenBalanceLog).filter(
+                FrozenBalanceLog.rollback_of_id == current_id
+            ).first()
+            if not next_log:
+                break
+            current_id = next_log.id
+
+        return {
+            "has_cycle": has_cycle,
+            "cycle_start_id": cycle_start,
+            "cycle_path": path,
+            "total_depth": len(path),
+            "is_truncated": len(path) >= max_depth
+        }
+
+    def break_freeze_rollback_cycle(self, log_id: int) -> FrozenBalanceLog:
+        log = self.db.query(FrozenBalanceLog).filter(
+            FrozenBalanceLog.id == log_id
+        ).first()
+        if not log:
+            raise ValueError("日志不存在")
+        log.rollback_of_id = None
+        log.reason = (log.reason or "") + " [环断裂]"
+        self.db.commit()
+        self.db.refresh(log)
+        return log
