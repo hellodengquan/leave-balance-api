@@ -281,3 +281,81 @@ class LeaveApplication(Base):
 
     employee = relationship("Employee", back_populates="applications")
     leave_type = relationship("LeaveType", back_populates="applications")
+
+
+class TruncateWarningLog(Base):
+    __tablename__ = "truncate_warning_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String(50), default="retro_truncate", nullable=False, index=True)
+    grant_transaction_id = Column(Integer, nullable=True, index=True)
+    employee_id = Column(Integer, nullable=True, index=True)
+    max_depth = Column(Integer, nullable=False)
+    actual_depth = Column(Integer, nullable=False)
+    has_cycle = Column(Boolean, default=False, nullable=False)
+    cycle_start_id = Column(Integer, nullable=True)
+    severity = Column(String(20), default="warn", nullable=False)
+    message = Column(Text, nullable=True)
+    operator = Column(String(100), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class FieldPermissionAudit(Base):
+    __tablename__ = "field_permission_audits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    permission_id = Column(Integer, ForeignKey("field_permissions.id"), nullable=False, index=True)
+    action = Column(String(20), nullable=False)
+    before_snapshot = Column(Text, nullable=True)
+    after_snapshot = Column(Text, nullable=True)
+    operator = Column(String(100), nullable=False)
+    rollback_of_id = Column(Integer, ForeignKey("field_permission_audits.id"), nullable=True)
+    rollback_token = Column(String(100), nullable=True, index=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SensitivePositionRule(Base):
+    __tablename__ = "sensitive_position_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_name = Column(String(100), nullable=False)
+    position_pattern = Column(String(200), nullable=False, index=True)
+    match_mode = Column(String(20), default="contains", nullable=False)
+    field_mappings = Column(Text, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    priority = Column(Integer, default=0, nullable=False)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class AuditRetentionConfig(Base):
+    __tablename__ = "audit_retention_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    resource = Column(String(50), unique=True, nullable=False, index=True)
+    retention_days = Column(Integer, default=365, nullable=False)
+    retention_mode = Column(String(20), default="delete", nullable=False)
+    archive_destination = Column(String(200), nullable=True)
+    last_cleanup_at = Column(DateTime, nullable=True)
+    cleanup_count = Column(Integer, default=0, nullable=False)
+    updated_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class MaskingPolicyRelease(Base):
+    __tablename__ = "masking_policy_releases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_version = Column(String(50), unique=True, nullable=False, index=True)
+    policy_payload = Column(Text, nullable=False)
+    checksum = Column(String(100), nullable=False)
+    gray_percent = Column(Integer, default=100, nullable=False)
+    gray_tags = Column(String(500), nullable=True)
+    status = Column(String(20), default="draft", nullable=False)
+    subscriber_ids = Column(String(500), nullable=True)
+    released_by = Column(String(100), nullable=True)
+    released_at = Column(DateTime, nullable=True)
+    rolled_back_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())

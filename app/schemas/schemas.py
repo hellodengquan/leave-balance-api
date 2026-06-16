@@ -155,6 +155,8 @@ class RetroLinkChain(BaseModel):
     has_cycle: bool = False
     is_truncated: bool = False
     cycle_start_id: Optional[int] = None
+    warning_log_id: Optional[int] = None
+    warning_severity: Optional[str] = None
 
 
 class FieldPermissionBase(BaseModel):
@@ -410,3 +412,79 @@ class FieldFilteredResponse(BaseModel):
     data: Dict[str, Any]
     masked_fields: List[str] = []
     hidden_fields: List[str] = []
+
+
+class RetroLinkChainTruncateWarning(BaseModel):
+    warning_id: int
+    severity: str
+    message: str
+    suggested_action: str = "increase_max_depth"
+
+
+class FieldPermissionAudit(BaseModel):
+    id: int
+    permission_id: int
+    action: str
+    operator: str
+    rollback_token: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SensitivePositionRuleBase(BaseModel):
+    rule_name: str
+    position_pattern: str
+    match_mode: str = "contains"
+    field_mappings: Dict[str, Any]
+    priority: int = 0
+
+
+class SensitivePositionRule(SensitivePositionRuleBase):
+    id: int
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AuditRetentionConfigBase(BaseModel):
+    resource: str
+    retention_days: int = 365
+    retention_mode: str = "delete"
+
+
+class AuditRetentionConfig(AuditRetentionConfigBase):
+    id: int
+    last_cleanup_at: Optional[datetime] = None
+    cleanup_count: int = 0
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MaskingPolicyReleaseBase(BaseModel):
+    policy_version: str
+    policy_payload: Dict[str, Any]
+    gray_percent: int = 100
+
+
+class MaskingPolicyRelease(MaskingPolicyReleaseBase):
+    id: int
+    checksum: str
+    status: str
+    released_by: Optional[str] = None
+    released_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CleanupResult(BaseModel):
+    resource: str
+    deleted_count: int
+    archived_count: int = 0
+    executed_at: datetime

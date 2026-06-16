@@ -6,7 +6,7 @@ from datetime import date, timedelta, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -1117,9 +1117,605 @@ def test_16_masking_audit_trail():
     print("✓ 脱敏审计旁路测试通过")
 
 
+def test_17_truncate_warning_log():
+    print("\n" + "="*60)
+    print("测试 17: is_truncated 预警日志记录")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    annual_id = seed["lt_ids"][0]
+    service = BalanceService(db)
+
+    _, prev_txn = service.grant_leave(emp_id, annual_id, 10.0, "初始发放", "admin", 2024)
+    prev_id = prev_txn.id
+    for i in range(15):
+        from app.models.models import LeaveTransaction
+        new_txn = LeaveTransaction(
+            account_id=prev_txn.account_id,
+            leave_type_id=annual_id,
+            employee_id=emp_id,
+            year=2024,
+            change_type="adjust_add",
+            change_days=1.0,
+            balance_after=10.0 + i + 1,
+            frozen_after=0.0,
+            reason=f"补发层级-{i+1}",
+            operator="test",
+            related_transaction_id=prev_id
+        )
+        db.add(new_txn)
+        db.flush()
+        prev_id = new_txn.id
+    db.commit()
+
+    chain = service.get_retro_chain(prev_id, max_depth=5)
+    print(f"✓ max_depth=5截断: is_truncated={chain.is_truncated}, "
+          f"warning_id={chain.warning_log_id}, severity={chain.warning_severity}")
+    assert chain.is_truncated is True
+    assert chain.warning_log_id is not None
+    assert chain.warning_severity == "warn"
+
+    total_warn, warnings = service.list_truncate_warnings(event_type="retro_truncate")
+    print(f"✓ 预警列表: {total_warn} 条 (type=retro_truncate)")
+    assert total_warn >= 1
+
+    from app.models.models import LeaveTransaction as LT
+    txn_a = db.query(LT).filter(LT.reason == "补发层级-3").first()
+    txn_b = db.query(LT).filter(LT.reason == "补发层级-7").first()
+    if txn_a and txn_b:
+        txn_a.related_transaction_id = txn_b.id
+        db.commit()
+
+    chain_cycle = service.get_retro_chain(prev_id, max_depth=30)
+    print(f"✓ 循环检测: has_cycle={chain_cycle.has_cycle}, "
+          f"severity={chain_cycle.warning_severity}")
+    assert chain_cycle.has_cycle is True
+    assert chain_cycle.warning_severity == "critical"
+
+    total_critical, criticals = service.list_truncate_warnings(severity="critical")
+    print(f"✓ 严重预警: {total_critical} 条")
+    assert total_critical >= 1
+
+    db.close()
+    print("✓ is_truncated 预警日志测试通过")
+
+
+def test_18_field_permission_rollback():
+    print("\n" + "="*60)
+    print("测试 18: FieldPermission 运行时切换回滚")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    service = BalanceService(db)
+
+    fp = service.set_field_permission("hr", "balance", "employee_name",
+                                       "masked", "name", operator="Admin_Alice")
+    total0, audits0 = service.list_field_permission_audits(permission_id=fp.id)
+    print(f"✓ 创建权限: id={fp.id}, 初始审计={total0} 条 (action=create)")
+    assert audits0[0].action == "create"
+
+    before_access = fp.access
+    before_pattern = fp.mask_pattern
+    token = audits0[0].rollback_token
+    print(f"  初始: access={before_access}, pattern={before_pattern}, token={token[:8]}...")
+
+    fp2 = service.set_field_permission("hr", "balance", "employee_name",
+                                        "hidden", None, operator="Admin_Bob")
+    total1, audits1 = service.list_field_permission_audits(permission_id=fp.id)
+    print(f"✓ 修改权限: access={fp2.access}, 审计={total1} 条 (新增update)")
+    assert audits1[0].action == "update"
+    assert fp2.access == "hidden"
+
+    rollback_token = audits1[0].rollback_token
+    fp_rb = service.rollback_field_permission(rollback_token, operator="Admin_Alice")
+    print(f"✓ 回滚: access={fp_rb.access}, pattern={fp_rb.mask_pattern}")
+    assert fp_rb.access == before_access
+    assert fp_rb.mask_pattern == before_pattern
+
+    total2, audits2 = service.list_field_permission_audits(permission_id=fp.id)
+    rollback_audits = [a for a in audits2 if a.action == "rollback"]
+    print(f"✓ 回滚审计: {len(rollback_audits)} 条 (共 {total2} 条)")
+    assert len(rollback_audits) >= 1
+    assert rollback_audits[0].rollback_of_id == audits1[0].id
+
+    try:
+        service.rollback_field_permission("not-exist-token")
+        assert False, "应抛出不存在异常"
+    except ValueError as e:
+        print(f"✓ 无效令牌保护: {e}")
+
+    db.close()
+    print("✓ FieldPermission 回滚测试通过")
+
+
+def test_19_cursor_secret_expiry():
+    print("\n" + "="*60)
+    print("测试 19: CursorSecret 密钥过期处理")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    annual_id = seed["lt_ids"][0]
+    service = BalanceService(db)
+
+    for i in range(15):
+        service.grant_leave(emp_id, annual_id, 1.0, f"grant-{i}", "admin", 2024)
+
+    secrets_old = service.list_cursor_secrets()
+    print(f"✓ 初始密钥: {len(secrets_old)} 条")
+
+    cs1 = service.rotate_cursor_secret("old-expiring-secret-v99")
+    expired_time = datetime.now() - timedelta(hours=1)
+    service.set_cursor_secret_expiry(cs1.id, expired_time)
+    db.refresh(cs1)
+    print(f"✓ 密钥v{cs1.version}: 设置过期时间 {cs1.expires_at.strftime('%H:%M')} (已过期)")
+
+    cs2 = service.rotate_cursor_secret("new-fresh-secret-v100")
+    print(f"✓ 密钥v{cs2.version}: 新主密钥 (未过期)")
+
+    page1 = service.get_transactions_cursor(limit=5)
+    last_id = page1.items[-1].id
+    cursor_new = page1.next_cursor
+
+    page2 = service.get_transactions_cursor(cursor=cursor_new, limit=5)
+    print(f"✓ 新密钥cursor解码: {len(page2.items)}条, 首id={page2.items[0].id if page2.items else None}")
+    assert len(page2.items) == 5
+    assert page2.items[0].id < last_id
+
+    expired_count = service.cleanup_expired_cursor_secrets()
+    print(f"✓ 清理过期密钥: {expired_count} 条")
+    assert expired_count >= 1
+
+    db.refresh(cs1)
+    print(f"  cs1.is_active = {cs1.is_active} (应为False)")
+    assert cs1.is_active is False
+
+    cs3 = service.rotate_cursor_secret("to-bedeleted-v101")
+    future = datetime.now() + timedelta(days=30)
+    service.set_cursor_secret_expiry(cs3.id, future)
+    count2 = service.cleanup_expired_cursor_secrets()
+    print(f"✓ 未过期密钥不被清理: 清理{count2} 条")
+    assert count2 == 0
+
+    db.close()
+    print("✓ CursorSecret 过期处理测试通过")
+
+
+def test_20_dfs_cycle_detection_performance():
+    print("\n" + "="*60)
+    print("测试 20: DFS 环检测性能与节点缓存")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    annual_id = seed["lt_ids"][0]
+    service = BalanceService(db)
+
+    acc = service._get_or_create_account(emp_id, annual_id, 2024)
+    from app.models.models import FrozenBalanceLog as FBL
+    logs = []
+    prev_id = None
+    for i in range(30):
+        log = FBL(
+            account_id=acc.id, employee_id=emp_id, leave_type_id=annual_id,
+            operation="freeze" if i % 2 == 0 else "unfreeze",
+            days=0.5, balance_before=acc.balance, balance_after=acc.balance,
+            operator="tester", reason=f"step-{i}", rollback_of_id=prev_id
+        )
+        db.add(log)
+        db.flush()
+        prev_id = log.id
+        logs.append(log.id)
+    db.commit()
+    print(f"✓ 构造30步线性链: {logs[0]} → ... → {logs[-1]}")
+
+    r1 = service.check_freeze_rollback_cycle_dfs(start_log_id=logs[-1], max_depth=50)
+    print(f"✓ 线性链DFS: has_cycle={r1['has_cycle']}, depth={r1['total_depth']}, "
+          f"nodes={r1['nodes_visited']}, colors={r1['dfs_color_count']}")
+    assert r1["has_cycle"] is False
+    assert r1["total_depth"] >= 30
+
+    first_log_id = logs[0]
+    first_log = db.query(FBL).filter(FBL.id == logs[0]).first()
+    if first_log:
+        first_log.rollback_of_id = logs[-1]
+        db.commit()
+    print(f"✓ 构造环: log#{first_log.id} → log#{logs[-1]} (形成 {logs[-1]}→...→{logs[0]}→{logs[-1]})")
+
+    node_cache = {}
+    r2 = service.check_freeze_rollback_cycle_dfs(start_log_id=logs[-1], max_depth=50,
+                                                  node_cache=node_cache)
+    print(f"✓ 环检测DFS: has_cycle={r2['has_cycle']}, start={r2['cycle_start_id']}, "
+          f"path_len={len(r2['cycle_path'])}")
+    assert r2["has_cycle"] is True
+    assert r2["cycle_start_id"] == logs[-1]
+    assert len(r2["cycle_path"]) >= 3
+
+    r3 = service.check_freeze_rollback_cycle_dfs(start_log_id=logs[0], max_depth=50,
+                                                  node_cache=node_cache)
+    print(f"✓ 缓存复用: 再次检测 nodes={r3['nodes_visited']}, cache_size={len(node_cache)}")
+    assert len(node_cache) >= 30
+
+    db.close()
+    print("✓ DFS 环检测性能测试通过")
+
+
+def test_21_sensitive_position_custom_rules():
+    print("\n" + "="*60)
+    print("测试 21: 敏感职位脱敏自定义规则")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    service = BalanceService(db)
+
+    from app.models.models import Employee
+    cfo = Employee(employee_no="E-CFO-001", name="王国富",
+                    department="财务", position="集团CFO", hire_date=date(2018,3,1))
+    svp = Employee(employee_no="E-SVP-002", name="李副总",
+                    department="技术", position="研发部SVP", hire_date=date(2019,6,1))
+    db.add_all([cfo, svp])
+    db.commit()
+    db.refresh(cfo); db.refresh(svp)
+    print(f"✓ 创建员工: CFO={cfo.name}, SVP={svp.name}")
+
+    rule_cfo = service.create_sensitive_position_rule(
+        rule_name="CFO级超敏规则",
+        position_pattern="CFO",
+        match_mode="contains",
+        field_mappings={
+            "employee_name": {"access": "masked", "pattern": "name"},
+            "frozen_balance": {"access": "hidden"},
+            "pending_expire_days": {"access": "hidden"}
+        },
+        priority=50,
+        created_by="Admin_System"
+    )
+    print(f"✓ 创建规则: id={rule_cfo.id}, pattern='{rule_cfo.position_pattern}', "
+          f"mode={rule_cfo.match_mode}, priority={rule_cfo.priority}")
+
+    from app.services.permission_service import PermissionService
+    perm = PermissionService(db)
+    auth_hr = perm.get_auth_context("hr1")
+    svc_hr = BalanceService(db, auth_hr)
+    service.set_field_permission("hr", "balance", "frozen_balance", "visible")
+
+    data_cfo = {"employee_id": cfo.id, "employee_name": cfo.name,
+                "department": "财务", "balance": 50.0, "frozen_balance": 5.0,
+                "pending_expire_days": 3.0}
+    r_cfo = svc_hr.apply_field_filter(data_cfo, "balance", target_employee_id=cfo.id)
+    print(f"✓ CFO脱敏: name={r_cfo.data.get('employee_name')}, "
+          f"balance={r_cfo.data.get('balance')}, "
+          f"has_frozen={'frozen_balance' in r_cfo.data}, "
+          f"has_pending={'pending_expire_days' in r_cfo.data}")
+    assert r_cfo.data["employee_name"] == "王**"
+    assert "frozen_balance" not in r_cfo.data
+    assert "pending_expire_days" not in r_cfo.data
+
+    rule_svp = service.create_sensitive_position_rule(
+        rule_name="SVP级规则",
+        position_pattern="SVP",
+        match_mode="exact",
+        field_mappings={
+            "employee_name": {"access": "masked", "pattern": "name"},
+        },
+        priority=30
+    )
+    rule_svp_updated = service.update_sensitive_position_rule(
+        rule_svp.id, match_mode="contains"
+    )
+    print(f"✓ 更新规则: exact → contains")
+    assert rule_svp_updated.match_mode == "contains"
+
+    data_svp = {"employee_id": svp.id, "employee_name": svp.name,
+                "department": "技术", "balance": 30.0, "frozen_balance": 2.0}
+    r_svp = svc_hr.apply_field_filter(data_svp, "balance", target_employee_id=svp.id)
+    print(f"✓ SVP脱敏: name={r_svp.data.get('employee_name')}, "
+          f"balance={r_svp.data.get('balance')}, "
+          f"has_frozen={'frozen_balance' in r_svp.data}")
+    assert r_svp.data["employee_name"] == "李**"
+    assert "frozen_balance" in r_svp.data
+
+    total, rules = service.list_sensitive_position_rules(is_active=True)
+    print(f"✓ 生效规则列表: {total} 条")
+    assert total >= 2
+
+    db.close()
+    print("✓ 敏感职位自定义规则测试通过")
+
+
+def test_22_audit_retention_cleanup():
+    print("\n" + "="*60)
+    print("测试 22: FieldAuditLog 留存策略与清理")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    service = BalanceService(db)
+
+    from app.models.models import FieldAuditLog
+    from datetime import timedelta as td
+    now = datetime.now()
+    old_logs = []
+    for i in range(15):
+        days_ago = [400, 380, 366, 364, 200, 10, 1][i % 7]
+        log = FieldAuditLog(
+            operator="zhangsan", operator_role="employee",
+            resource="balance", field_name="employee_name",
+            target_employee_id=emp_id,
+            original_value=f"测试员工{i}", masked_value=f"测***",
+            mask_pattern="name", access_type="masked",
+            request_id=f"req-old-{i:04d}"
+        )
+        db.add(log)
+        db.flush()
+        log.created_at = now - td(days=days_ago)
+        old_logs.append((log.id, days_ago))
+    for i in range(5):
+        log = FieldAuditLog(
+            operator="lisi", operator_role="hr",
+            resource="employee", field_name="phone",
+            target_employee_id=emp_id,
+            original_value="13800138000", masked_value="138****8000",
+            mask_pattern="phone", access_type="masked",
+            request_id=f"req-new-{i:04d}"
+        )
+        db.add(log)
+    db.commit()
+    old_count = db.query(func.count(FieldAuditLog.id)).scalar()
+    print(f"✓ 构造日志: balance={len([l for l in old_logs])}条, employee=5条, 共{old_count}条")
+
+    cfg_bal = service.set_audit_retention(
+        resource="balance", retention_days=365,
+        retention_mode="delete", updated_by="admin_audit"
+    )
+    print(f"✓ balance留存策略: {cfg_bal.retention_days}天, mode={cfg_bal.retention_mode}")
+
+    cfg_get = service.get_audit_retention("balance")
+    assert cfg_get.retention_days == 365
+
+    result_bal = service.cleanup_audit_logs("balance")
+    print(f"✓ 清理balance: deleted={result_bal.deleted_count}, "
+          f"archived={result_bal.archived_count}")
+    assert result_bal.deleted_count >= 3
+
+    remaining = db.query(FieldAuditLog).filter(
+        FieldAuditLog.resource == "balance"
+    ).count()
+    print(f"  balance剩余: {remaining} 条")
+    assert remaining < 15
+
+    cfg_emp = service.set_audit_retention("employee", 180, "archive")
+    result_emp = service.cleanup_audit_logs("employee")
+    print(f"✓ 清理employee(archive): deleted={result_emp.deleted_count}, "
+          f"archived={result_emp.archived_count}")
+
+    cfg_check = service.get_audit_retention("balance")
+    print(f"✓ 清理记录: last_cleanup={cfg_check.last_cleanup_at is not None}, "
+          f"累计count={cfg_check.cleanup_count}")
+    assert cfg_check.last_cleanup_at is not None
+    assert cfg_check.cleanup_count >= result_bal.deleted_count
+
+    db.close()
+    print("✓ 审计留存策略测试通过")
+
+
+def test_23_masking_policy_release_flow():
+    print("\n" + "="*60)
+    print("测试 23: scene_mask 脱敏策略下发与灰度")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    service = BalanceService(db)
+
+    payload_v1 = {
+        "balance": {
+            "employee_name": {"action": "masked", "pattern": "name"},
+            "frozen_balance": {"action": "hidden"}
+        },
+        "employee": {
+            "phone": {"action": "masked", "pattern": "phone"},
+            "email": {"action": "masked", "pattern": "email"}
+        }
+    }
+    rel_v1 = service.create_masking_policy_release(
+        policy_version="POLICY-V1.0.0",
+        policy_payload=payload_v1,
+        gray_percent=100,
+        gray_tags=["hr", "finance"],
+        subscriber_ids=["balance-api", "hr-dashboard"],
+        released_by="Governance_Team"
+    )
+    print(f"✓ 创建策略: ver={rel_v1.policy_version}, "
+          f"checksum={rel_v1.checksum[:10]}..., status={rel_v1.status}")
+    assert rel_v1.status == "draft"
+    assert rel_v1.gray_percent == 100
+
+    before = service.get_active_masking_policy()
+    print(f"  发布前: active_policy={before is not None}")
+    assert before is None
+
+    published = service.publish_masking_policy("POLICY-V1.0.0")
+    print(f"✓ 发布: status={published.status}, released_at={published.released_at.strftime('%H:%M')}")
+    assert published.status == "active"
+
+    active = service.get_active_masking_policy()
+    print(f"✓ 当前生效: ver={active['policy_version']}, "
+          f"gray_tags={active['gray_tags']}, subscribers={active['subscriber_ids']}")
+    assert active["policy_version"] == "POLICY-V1.0.0"
+
+    data_bal = {
+        "employee_id": 1, "employee_name": "张三丰",
+        "balance": 20.0, "frozen_balance": 3.0,
+        "phone": "13900139000", "email": "zhangsan@company.com"
+    }
+    masked = service.apply_released_masking_policy(data_bal, "balance")
+    print(f"✓ 策略下发脱敏: name={masked['employee_name']}, "
+          f"has_frozen={'frozen_balance' in masked}, balance={masked.get('balance')}")
+    assert masked["employee_name"] == "张**"
+    assert "frozen_balance" not in masked
+
+    payload_v2 = {
+        "balance": {
+            "employee_name": {"action": "visible"},
+            "balance": {"action": "masked", "pattern": "digit"}
+        }
+    }
+    rel_v2 = service.create_masking_policy_release(
+        policy_version="POLICY-V2.0.0",
+        policy_payload=payload_v2,
+        gray_percent=0,
+        released_by="Governance_Team"
+    )
+    published_v2 = service.publish_masking_policy("POLICY-V2.0.0")
+    print(f"✓ 发布V2灰度0%: status={published_v2.status}, gray={published_v2.gray_percent}%")
+
+    gray_0 = service.apply_released_masking_policy(data_bal, "balance", gray_user_tag="employee")
+    print(f"  灰度外: name={gray_0.get('employee_name')}, "
+          f"has_frozen={'frozen_balance' in gray_0}")
+    assert gray_0.get("employee_name") == "张三丰"
+    assert "frozen_balance" in gray_0
+
+    published_v2.gray_percent = 100
+    db.commit()
+    gray_100 = service.apply_released_masking_policy(data_bal, "balance")
+    print(f"  灰度100%: name={gray_100.get('employee_name')}, "
+          f"has_balance={'balance' in gray_100}")
+    assert gray_100.get("employee_name") == "张三丰"
+
+    rb = service.rollback_masking_policy("POLICY-V2.0.0")
+    print(f"✓ 回滚V2: status={rb.status}, rolled_back={rb.rolled_back_at is not None}")
+    assert rb.status == "rolled_back"
+
+    active_after = service.get_active_masking_policy()
+    print(f"  回滚后生效版本: {active_after['policy_version'] if active_after else None}")
+    assert active_after is not None
+    assert active_after["policy_version"] == "POLICY-V1.0.0"
+
+    db.close()
+    print("✓ 策略下发与灰度测试通过")
+
+
+def test_24_corner_cases_and_boundary():
+    print("\n" + "="*60)
+    print("测试 24: 边界场景与异常路径覆盖率")
+    print("="*60)
+
+    db = setup_test_db()
+    seed = seed_base_data(db)
+    emp_id = seed["emp_ids"][0]
+    sick_id = seed["lt_ids"][2]
+    service = BalanceService(db)
+
+    past_expire = date.today() - timedelta(days=3)
+    service.grant_leave(emp_id, sick_id, 3.0, "病假", "admin", 2024, expire_date=past_expire)
+    holds = service.scan_expired_and_create_holds(operator="system")
+    hold = holds[0] if holds else None
+
+    if hold:
+        try:
+            service.reapply_expire_hold(999999, operator="tester")
+            assert False
+        except ValueError as e:
+            print(f"✓ reapply不存在hold: {e}")
+
+        service.approve_expire_hold(hold.id, "HR")
+        try:
+            service.reapply_expire_hold(hold.id, operator="tester")
+            assert False
+        except ValueError as e:
+            print(f"✓ reapply已approved: {e}")
+
+    warnings_total, _ = service.list_truncate_warnings(severity="info")
+    print(f"✓ list_warnings空级别过滤: {warnings_total} 条")
+
+    try:
+        service.rollback_field_permission("invalid-token-xyz")
+        assert False
+    except ValueError as e:
+        print(f"✓ rollback无效token: {e}")
+
+    total_audits, _ = service.list_field_permission_audits(permission_id=99999)
+    print(f"✓ audit空permission过滤: {total_audits} 条")
+
+    try:
+        service.set_cursor_secret_expiry(99999, datetime.now())
+        assert False
+    except ValueError as e:
+        print(f"✓ 过期不存在密钥: {e}")
+
+    try:
+        service.deactivate_cursor_secret(99999)
+        assert False
+    except ValueError as e:
+        print(f"✓ 停用不存在密钥: {e}")
+
+    primary = service.rotate_cursor_secret("secret-primary-boundary")
+    try:
+        service.deactivate_cursor_secret(primary.id)
+        assert False
+    except ValueError as e:
+        print(f"✓ 停用主密钥被拒: {e}")
+
+    try:
+        service.break_freeze_rollback_cycle(999999)
+        assert False
+    except ValueError as e:
+        print(f"✓ 断裂不存在日志: {e}")
+
+    r_none = service.check_freeze_rollback_cycle_dfs(start_log_id=999999)
+    print(f"✓ DFS不存在起点: has_cycle={r_none['has_cycle']}, nodes={r_none['nodes_visited']}")
+    assert r_none["has_cycle"] is False
+
+    try:
+        service.update_sensitive_position_rule(99999, is_active=False)
+        assert False
+    except ValueError as e:
+        print(f"✓ 更新不存在规则: {e}")
+
+    cfg_default = service.get_audit_retention("unknown-resource")
+    print(f"✓ 未知资源默认留存: {cfg_default.retention_days}天")
+    assert cfg_default.retention_days == 365
+
+    r_clean_empty = service.cleanup_audit_logs("nonexistent-resource")
+    print(f"✓ 清理不存在资源: deleted={r_clean_empty.deleted_count}")
+
+    try:
+        service.publish_masking_policy("NOT-EXIST-VERSION")
+        assert False
+    except ValueError as e:
+        print(f"✓ 发布不存在版本: {e}")
+
+    try:
+        service.create_masking_policy_release("POLICY-V1.0.0", {"x": 1})
+    except ValueError as e:
+        print(f"✓ 创建重复版本: {e}")
+
+    from app.services.permission_service import PermissionService
+    perm = PermissionService(db)
+    auth_hr = perm.get_auth_context("hr1")
+    svc_hr = BalanceService(db, auth_hr)
+
+    normal_emp = {"employee_id": emp_id, "employee_name": "张三丰",
+                   "balance": 5.0, "frozen_balance": 1.0}
+    r_no_target = svc_hr.apply_field_filter(normal_emp, "balance", target_employee_id=None)
+    print(f"✓ 无目标员工场景化脱敏: name={r_no_target.data['employee_name']}")
+    assert r_no_target.data["employee_name"] == "张三丰"
+
+    db.close()
+    print("✓ 边界场景覆盖测试通过")
+
+
 def run_all_tests():
     print("\n" + "#"*60)
-    print("#  员工假期余额管理API - 第三批8大特性测试")
+    print("#  员工假期余额管理API - 第四批8大收尾特性测试")
     print("#"*60)
 
     test_funcs = [
@@ -1131,6 +1727,14 @@ def run_all_tests():
         test_14_rollback_chain_cycle_detection,
         test_15_hr_scenario_masking,
         test_16_masking_audit_trail,
+        test_17_truncate_warning_log,
+        test_18_field_permission_rollback,
+        test_19_cursor_secret_expiry,
+        test_20_dfs_cycle_detection_performance,
+        test_21_sensitive_position_custom_rules,
+        test_22_audit_retention_cleanup,
+        test_23_masking_policy_release_flow,
+        test_24_corner_cases_and_boundary,
     ]
 
     passed = 0
@@ -1148,7 +1752,7 @@ def run_all_tests():
     print("\n" + "#"*60)
     print(f"#  测试结果: 通过 {passed}, 失败 {failed}")
     if failed == 0:
-        print("#  ✓ 全部第三批特性测试通过！")
+        print("#  ✓ 全部第四批收尾特性测试通过！")
     print("#"*60 + "\n")
     return failed == 0
 

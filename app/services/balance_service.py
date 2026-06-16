@@ -9,7 +9,9 @@ from app.models.models import (
     Employee, LeaveType, LeaveAccount, LeaveTransaction,
     LeaveApplication, HolidayConfig, FrozenBalanceLog,
     ExpireHold, ExpireHoldApproval, GrantRetroLink, SysUser,
-    FieldPermission, CursorSecret, FieldAuditLog
+    FieldPermission, CursorSecret, FieldAuditLog,
+    TruncateWarningLog, FieldPermissionAudit, SensitivePositionRule,
+    AuditRetentionConfig, MaskingPolicyRelease
 )
 from app.schemas import schemas
 from app.utils import (
@@ -1355,6 +1357,8 @@ class BalanceService:
         has_cycle = False
         is_truncated = False
         cycle_start_id = None
+        warning_log_id = None
+        warning_severity = None
 
         for depth in range(max_depth):
             if current_txn_id is None:
@@ -1411,14 +1415,58 @@ class BalanceService:
             if depth == max_depth - 1 and next_id is not None:
                 is_truncated = True
 
+        if is_truncated or has_cycle:
+            emp_id = chain[0].transaction_id and self.db.query(
+                LeaveTransaction.employee_id
+            ).filter(LeaveTransaction.id == grant_transaction_id).scalar()
+            severity = "critical" if has_cycle else "warn"
+            msg_parts = []
+            if is_truncated:
+                msg_parts.append(f"深度超过max_depth={max_depth}")
+            if has_cycle:
+                msg_parts.append(f"检测到循环引用(起点={cycle_start_id})")
+            warning = TruncateWarningLog(
+                event_type="retro_cycle" if has_cycle else "retro_truncate",
+                grant_transaction_id=grant_transaction_id,
+                employee_id=emp_id,
+                max_depth=max_depth,
+                actual_depth=len(chain),
+                has_cycle=has_cycle,
+                cycle_start_id=cycle_start_id,
+                severity=severity,
+                message="; ".join(msg_parts),
+                operator=self.auth.username if self.auth else None
+            )
+            self.db.add(warning)
+            self.db.commit()
+            self.db.refresh(warning)
+            warning_log_id = warning.id
+            warning_severity = severity
+
         return schemas.RetroLinkChain(
             grant_transaction_id=grant_transaction_id,
             chain=chain,
             total_depth=len(chain),
             has_cycle=has_cycle,
             is_truncated=is_truncated,
-            cycle_start_id=cycle_start_id
+            cycle_start_id=cycle_start_id,
+            warning_log_id=warning_log_id,
+            warning_severity=warning_severity
         )
+
+    def list_truncate_warnings(
+        self, event_type: Optional[str] = None,
+        severity: Optional[str] = None,
+        skip: int = 0, limit: int = 100
+    ) -> Tuple[int, List[TruncateWarningLog]]:
+        query = self.db.query(TruncateWarningLog)
+        if event_type:
+            query = query.filter(TruncateWarningLog.event_type == event_type)
+        if severity:
+            query = query.filter(TruncateWarningLog.severity == severity)
+        total = query.count()
+        items = query.order_by(TruncateWarningLog.id.desc()).offset(skip).limit(limit).all()
+        return total, items
 
     def _get_effective_field_perms(self, role: str, resource: str) -> List[FieldPermission]:
         cached = get_cached_field_perms(role, resource)
@@ -1435,18 +1483,43 @@ class BalanceService:
     def set_field_permission(
         self, role: str, resource: str, field_name: str,
         access: str = "visible", mask_pattern: Optional[str] = None,
-        is_active: bool = True, priority: int = 0
+        is_active: bool = True, priority: int = 0,
+        operator: Optional[str] = None
     ) -> FieldPermission:
+        import json, uuid as _uuid
         existing = self.db.query(FieldPermission).filter(
             FieldPermission.role == role,
             FieldPermission.resource == resource,
             FieldPermission.field_name == field_name
         ).first()
+
+        before_snap = None
         if existing:
+            before_snap = json.dumps({
+                "access": existing.access,
+                "mask_pattern": existing.mask_pattern,
+                "is_active": existing.is_active,
+                "priority": existing.priority
+            }, ensure_ascii=False)
             existing.access = access
             existing.mask_pattern = mask_pattern
             existing.is_active = is_active
             existing.priority = priority
+            self.db.flush()
+            after_snap = json.dumps({
+                "access": access, "mask_pattern": mask_pattern,
+                "is_active": is_active, "priority": priority
+            }, ensure_ascii=False)
+            token = _uuid.uuid4().hex[:12]
+            audit = FieldPermissionAudit(
+                permission_id=existing.id,
+                action="update",
+                before_snapshot=before_snap,
+                after_snapshot=after_snap,
+                operator=operator or (self.auth.username if self.auth else "system"),
+                rollback_token=token
+            )
+            self.db.add(audit)
             self.db.commit()
             self.db.refresh(existing)
         else:
@@ -1456,11 +1529,77 @@ class BalanceService:
                 is_active=is_active, priority=priority
             )
             self.db.add(fp)
+            self.db.flush()
+            after_snap = json.dumps({
+                "access": access, "mask_pattern": mask_pattern,
+                "is_active": is_active, "priority": priority
+            }, ensure_ascii=False)
+            token = _uuid.uuid4().hex[:12]
+            audit = FieldPermissionAudit(
+                permission_id=fp.id,
+                action="create",
+                before_snapshot=None,
+                after_snapshot=after_snap,
+                operator=operator or (self.auth.username if self.auth else "system"),
+                rollback_token=token
+            )
+            self.db.add(audit)
             self.db.commit()
             self.db.refresh(fp)
             existing = fp
         invalidate_field_perm_cache()
         return existing
+
+    def rollback_field_permission(
+        self, rollback_token: str, operator: Optional[str] = None
+    ) -> FieldPermission:
+        import json
+        audit = self.db.query(FieldPermissionAudit).filter(
+            FieldPermissionAudit.rollback_token == rollback_token
+        ).first()
+        if not audit:
+            raise ValueError("回滚令牌不存在或已失效")
+        if audit.before_snapshot is None:
+            raise ValueError("创建操作不可回滚（请直接删除权限）")
+        before = json.loads(audit.before_snapshot)
+        fp = self.db.query(FieldPermission).filter(
+            FieldPermission.id == audit.permission_id
+        ).first()
+        if not fp:
+            raise ValueError("关联权限已不存在")
+        after_snap = json.dumps({
+            "access": fp.access, "mask_pattern": fp.mask_pattern,
+            "is_active": fp.is_active, "priority": fp.priority
+        }, ensure_ascii=False)
+        fp.access = before["access"]
+        fp.mask_pattern = before.get("mask_pattern")
+        fp.is_active = before.get("is_active", True)
+        fp.priority = before.get("priority", 0)
+        self.db.flush()
+        new_audit = FieldPermissionAudit(
+            permission_id=fp.id,
+            action="rollback",
+            before_snapshot=after_snap,
+            after_snapshot=audit.before_snapshot,
+            operator=operator or (self.auth.username if self.auth else "system"),
+            rollback_of_id=audit.id
+        )
+        self.db.add(new_audit)
+        self.db.commit()
+        self.db.refresh(fp)
+        invalidate_field_perm_cache()
+        return fp
+
+    def list_field_permission_audits(
+        self, permission_id: Optional[int] = None,
+        skip: int = 0, limit: int = 100
+    ) -> Tuple[int, List[FieldPermissionAudit]]:
+        query = self.db.query(FieldPermissionAudit)
+        if permission_id:
+            query = query.filter(FieldPermissionAudit.permission_id == permission_id)
+        total = query.count()
+        items = query.order_by(FieldPermissionAudit.id.desc()).offset(skip).limit(limit).all()
+        return total, items
 
     def toggle_field_permission(
         self, role: str, resource: str, field_name: str, is_active: bool
@@ -1484,25 +1623,73 @@ class BalanceService:
         if not self.auth or target_employee_id is None:
             return []
 
+        extra_perms = []
+        target_emp = self.db.query(Employee).filter(
+            Employee.id == target_employee_id
+        ).first()
+        if not target_emp or not target_emp.position:
+            return extra_perms
+
         if self.auth.role == "hr" and resource == "balance":
-            target_emp = self.db.query(Employee).filter(
-                Employee.id == target_employee_id
-            ).first()
-            if target_emp and target_emp.position and "总监" in target_emp.position:
-                class _TempPerm:
-                    def __init__(self, role, resource, field_name, access, mask_pattern):
-                        self.role = role
-                        self.resource = resource
-                        self.field_name = field_name
-                        self.access = access
-                        self.mask_pattern = mask_pattern
-                        self.is_active = True
-                        self.priority = 100
-                return [
-                    _TempPerm("hr", "balance", "employee_name", "masked", "name"),
-                    _TempPerm("hr", "balance", "frozen_balance", "hidden", None),
-                ]
-        return []
+            rules = self.db.query(SensitivePositionRule).filter(
+                SensitivePositionRule.is_active == True
+            ).order_by(SensitivePositionRule.priority.desc()).all()
+            matched_rule = None
+            for r in rules:
+                if r.match_mode == "exact" and target_emp.position == r.position_pattern:
+                    matched_rule = r
+                    break
+                elif r.match_mode == "contains" and r.position_pattern in target_emp.position:
+                    matched_rule = r
+                    break
+                elif r.match_mode == "startswith" and target_emp.position.startswith(r.position_pattern):
+                    matched_rule = r
+                    break
+
+            if not matched_rule and self.auth.role == "hr":
+                if "总监" in target_emp.position or "VP" in target_emp.position:
+                    class _TempPerm:
+                        def __init__(self, role, resource, field_name, access, mask_pattern):
+                            self.role = role
+                            self.resource = resource
+                            self.field_name = field_name
+                            self.access = access
+                            self.mask_pattern = mask_pattern
+                            self.is_active = True
+                            self.priority = 100
+                    extra_perms = [
+                        _TempPerm("hr", "balance", "employee_name", "masked", "name"),
+                        _TempPerm("hr", "balance", "frozen_balance", "hidden", None),
+                    ]
+                    return extra_perms
+
+            if matched_rule:
+                import json
+                try:
+                    mappings = json.loads(matched_rule.field_mappings)
+                    class _TempPerm:
+                        def __init__(self, role, resource, field_name, access, mask_pattern):
+                            self.role = role
+                            self.resource = resource
+                            self.field_name = field_name
+                            self.access = access
+                            self.mask_pattern = mask_pattern
+                            self.is_active = True
+                            self.priority = matched_rule.priority + 100
+                    for field_name, cfg in mappings.items():
+                        if isinstance(cfg, dict):
+                            extra_perms.append(_TempPerm(
+                                self.auth.role, resource, field_name,
+                                cfg.get("access", "masked"),
+                                cfg.get("pattern") or cfg.get("mask_pattern")
+                            ))
+                        else:
+                            extra_perms.append(_TempPerm(
+                                self.auth.role, resource, field_name, cfg, None
+                            ))
+                except Exception:
+                    pass
+        return extra_perms
 
     def _record_field_audit(
         self, operator: str, role: str, resource: str, field: str,
@@ -1547,14 +1734,43 @@ class BalanceService:
         return total, logs
 
     def _get_active_cursor_secrets(self) -> List[str]:
+        now = datetime.now()
         secrets = self.db.query(CursorSecret).filter(
-            CursorSecret.is_active == True
+            CursorSecret.is_active == True,
+            or_(CursorSecret.expires_at.is_(None), CursorSecret.expires_at > now)
         ).order_by(CursorSecret.is_primary.desc(), CursorSecret.version.desc()).all()
         keys = [s.secret_key for s in secrets]
         from app.utils import CURSOR_SECRET
         if CURSOR_SECRET not in keys:
             keys.append(CURSOR_SECRET)
         return keys
+
+    def cleanup_expired_cursor_secrets(self) -> int:
+        now = datetime.now()
+        expired = self.db.query(CursorSecret).filter(
+            CursorSecret.is_active == True,
+            CursorSecret.is_primary == False,
+            CursorSecret.expires_at.isnot(None),
+            CursorSecret.expires_at <= now
+        ).all()
+        count = 0
+        for s in expired:
+            s.is_active = False
+            count += 1
+        if count > 0:
+            self.db.commit()
+        return count
+
+    def set_cursor_secret_expiry(
+        self, secret_id: int, expires_at: datetime
+    ) -> CursorSecret:
+        cs = self.db.query(CursorSecret).filter(CursorSecret.id == secret_id).first()
+        if not cs:
+            raise ValueError("密钥不存在")
+        cs.expires_at = expires_at
+        self.db.commit()
+        self.db.refresh(cs)
+        return cs
 
     def _get_primary_cursor_secret(self) -> str:
         primary = self.db.query(CursorSecret).filter(
@@ -1733,3 +1949,364 @@ class BalanceService:
         self.db.commit()
         self.db.refresh(log)
         return log
+
+    def check_freeze_rollback_cycle_dfs(
+        self, application_id: Optional[int] = None,
+        start_log_id: Optional[int] = None,
+        max_depth: int = 100,
+        node_cache: Optional[Dict[int, int]] = None
+    ) -> Dict[str, Any]:
+        start_id = start_log_id
+        if application_id and not start_id:
+            first_log = self.db.query(FrozenBalanceLog).filter(
+                FrozenBalanceLog.application_id == application_id
+            ).order_by(FrozenBalanceLog.id.asc()).first()
+            if first_log:
+                start_id = first_log.id
+
+        if not start_id:
+            return {"has_cycle": False, "cycle_path": [], "total_depth": 0, "nodes_visited": 0}
+
+        cache = node_cache if node_cache is not None else {}
+        WHITE, GRAY, BLACK = 0, 1, 2
+
+        def _adjacent_parent(nid: int) -> List[int]:
+            if nid in cache:
+                return cache[nid]
+            current_log = self.db.query(FrozenBalanceLog).filter(
+                FrozenBalanceLog.id == nid
+            ).first()
+            result = []
+            if current_log and current_log.rollback_of_id is not None:
+                result = [current_log.rollback_of_id]
+            cache[nid] = result
+            return result
+
+        color: Dict[int, int] = {}
+        parent: Dict[int, Optional[int]] = {}
+        cycle_info = {"found": False, "start": None, "path": []}
+        nodes_visited = 0
+        depth_count = 0
+        is_truncated = False
+
+        def dfs(nid: int, depth: int):
+            nonlocal nodes_visited, depth_count, is_truncated
+            nodes_visited += 1
+            if depth > depth_count:
+                depth_count = depth
+            if depth >= max_depth:
+                is_truncated = True
+                return
+            color[nid] = GRAY
+            for nb in _adjacent_parent(nid):
+                if color.get(nb, WHITE) == GRAY:
+                    cycle_info["found"] = True
+                    cycle_info["start"] = nb
+                    path = [nb]
+                    cur = nid
+                    while cur is not None and cur != nb:
+                        path.append(cur)
+                        cur = parent.get(cur)
+                    path.append(nb)
+                    cycle_info["path"] = list(reversed(path))
+                    return
+                elif color.get(nb, WHITE) == WHITE:
+                    parent[nb] = nid
+                    dfs(nb, depth + 1)
+                    if cycle_info["found"]:
+                        return
+            color[nid] = BLACK
+
+        parent[start_id] = None
+        dfs(start_id, 0)
+
+        full_path = []
+        if not cycle_info["found"]:
+            cur = start_id
+            while cur is not None and len(full_path) <= max_depth:
+                full_path.append(cur)
+                nb_list = _adjacent_parent(cur)
+                cur = nb_list[0] if nb_list else None
+
+        return {
+            "has_cycle": cycle_info["found"],
+            "cycle_start_id": cycle_info["start"],
+            "cycle_path": cycle_info["path"] if cycle_info["found"] else full_path,
+            "total_depth": max(depth_count, len(full_path)),
+            "is_truncated": is_truncated,
+            "nodes_visited": nodes_visited,
+            "dfs_color_count": len(color)
+        }
+
+    def create_sensitive_position_rule(
+        self, rule_name: str, position_pattern: str,
+        field_mappings: Dict[str, Any],
+        match_mode: str = "contains", priority: int = 0,
+        created_by: Optional[str] = None
+    ) -> SensitivePositionRule:
+        import json
+        rule = SensitivePositionRule(
+            rule_name=rule_name,
+            position_pattern=position_pattern,
+            match_mode=match_mode,
+            field_mappings=json.dumps(field_mappings, ensure_ascii=False),
+            is_active=True,
+            priority=priority,
+            created_by=created_by or (self.auth.username if self.auth else "system")
+        )
+        self.db.add(rule)
+        self.db.commit()
+        self.db.refresh(rule)
+        return rule
+
+    def update_sensitive_position_rule(
+        self, rule_id: int,
+        rule_name: Optional[str] = None,
+        position_pattern: Optional[str] = None,
+        field_mappings: Optional[Dict[str, Any]] = None,
+        match_mode: Optional[str] = None,
+        is_active: Optional[bool] = None,
+        priority: Optional[int] = None
+    ) -> SensitivePositionRule:
+        import json
+        rule = self.db.query(SensitivePositionRule).filter(
+            SensitivePositionRule.id == rule_id
+        ).first()
+        if not rule:
+            raise ValueError("敏感职位规则不存在")
+        if rule_name is not None:
+            rule.rule_name = rule_name
+        if position_pattern is not None:
+            rule.position_pattern = position_pattern
+        if field_mappings is not None:
+            rule.field_mappings = json.dumps(field_mappings, ensure_ascii=False)
+        if match_mode is not None:
+            rule.match_mode = match_mode
+        if is_active is not None:
+            rule.is_active = is_active
+        if priority is not None:
+            rule.priority = priority
+        self.db.commit()
+        self.db.refresh(rule)
+        return rule
+
+    def list_sensitive_position_rules(
+        self, is_active: Optional[bool] = None, skip: int = 0, limit: int = 100
+    ) -> Tuple[int, List[SensitivePositionRule]]:
+        query = self.db.query(SensitivePositionRule)
+        if is_active is not None:
+            query = query.filter(SensitivePositionRule.is_active == is_active)
+        total = query.count()
+        items = query.order_by(SensitivePositionRule.priority.desc(),
+                               SensitivePositionRule.id.desc()).offset(skip).limit(limit).all()
+        return total, items
+
+    def set_audit_retention(
+        self, resource: str, retention_days: int,
+        retention_mode: str = "delete",
+        updated_by: Optional[str] = None
+    ) -> AuditRetentionConfig:
+        existing = self.db.query(AuditRetentionConfig).filter(
+            AuditRetentionConfig.resource == resource
+        ).first()
+        if existing:
+            existing.retention_days = retention_days
+            existing.retention_mode = retention_mode
+            existing.updated_by = updated_by or (self.auth.username if self.auth else "system")
+            self.db.commit()
+            self.db.refresh(existing)
+            return existing
+        cfg = AuditRetentionConfig(
+            resource=resource,
+            retention_days=retention_days,
+            retention_mode=retention_mode,
+            updated_by=updated_by or (self.auth.username if self.auth else "system")
+        )
+        self.db.add(cfg)
+        self.db.commit()
+        self.db.refresh(cfg)
+        return cfg
+
+    def get_audit_retention(self, resource: str) -> AuditRetentionConfig:
+        cfg = self.db.query(AuditRetentionConfig).filter(
+            AuditRetentionConfig.resource == resource
+        ).first()
+        if not cfg:
+            cfg = AuditRetentionConfig(
+                resource=resource, retention_days=365, retention_mode="delete"
+            )
+        return cfg
+
+    def cleanup_audit_logs(
+        self, resource: str, force_days: Optional[int] = None
+    ) -> schemas.CleanupResult:
+        cfg = self.get_audit_retention(resource)
+        days = force_days if force_days is not None else cfg.retention_days
+        cutoff = datetime.now() - timedelta(days=days)
+
+        query = self.db.query(FieldAuditLog).filter(
+            FieldAuditLog.resource == resource,
+            FieldAuditLog.created_at < cutoff
+        )
+        total_target = query.count()
+
+        archived = 0
+        if cfg.retention_mode == "archive":
+            archived = total_target
+
+        deleted = 0
+        if total_target > 0:
+            deleted = query.delete(synchronize_session=False)
+            self.db.commit()
+
+        cfg.last_cleanup_at = datetime.now()
+        cfg.cleanup_count = (cfg.cleanup_count or 0) + deleted
+        self.db.commit()
+
+        return schemas.CleanupResult(
+            resource=resource,
+            deleted_count=deleted,
+            archived_count=archived,
+            executed_at=datetime.now()
+        )
+
+    def create_masking_policy_release(
+        self, policy_version: str,
+        policy_payload: Dict[str, Any],
+        gray_percent: int = 100,
+        gray_tags: Optional[List[str]] = None,
+        subscriber_ids: Optional[List[str]] = None,
+        released_by: Optional[str] = None
+    ) -> MaskingPolicyRelease:
+        import json, hashlib
+        payload_str = json.dumps(policy_payload, sort_keys=True, ensure_ascii=False)
+        checksum = hashlib.sha256(payload_str.encode()).hexdigest()[:16]
+        existing = self.db.query(MaskingPolicyRelease).filter(
+            MaskingPolicyRelease.policy_version == policy_version
+        ).first()
+        if existing:
+            raise ValueError(f"版本 {policy_version} 已存在")
+        release = MaskingPolicyRelease(
+            policy_version=policy_version,
+            policy_payload=payload_str,
+            checksum=checksum,
+            gray_percent=gray_percent,
+            gray_tags=",".join(gray_tags) if gray_tags else None,
+            subscriber_ids=",".join(subscriber_ids) if subscriber_ids else None,
+            status="draft",
+            released_by=released_by or (self.auth.username if self.auth else "system")
+        )
+        self.db.add(release)
+        self.db.commit()
+        self.db.refresh(release)
+        return release
+
+    def publish_masking_policy(self, policy_version: str) -> MaskingPolicyRelease:
+        release = self.db.query(MaskingPolicyRelease).filter(
+            MaskingPolicyRelease.policy_version == policy_version
+        ).first()
+        if not release:
+            raise ValueError("策略版本不存在")
+        if release.status == "active":
+            return release
+        prev_active = self.db.query(MaskingPolicyRelease).filter(
+            MaskingPolicyRelease.status == "active"
+        ).first()
+        if prev_active:
+            prev_active.status = "superseded"
+        release.status = "active"
+        release.released_at = datetime.now()
+        self.db.commit()
+        self.db.refresh(release)
+        invalidate_field_perm_cache()
+        return release
+
+    def rollback_masking_policy(self, policy_version: str) -> MaskingPolicyRelease:
+        release = self.db.query(MaskingPolicyRelease).filter(
+            MaskingPolicyRelease.policy_version == policy_version
+        ).first()
+        if not release:
+            raise ValueError("策略版本不存在")
+        if release.status != "active":
+            raise ValueError("只有active状态可回滚")
+        release.status = "rolled_back"
+        release.rolled_back_at = datetime.now()
+        prev = self.db.query(MaskingPolicyRelease).filter(
+            MaskingPolicyRelease.status == "superseded"
+        ).order_by(MaskingPolicyRelease.id.desc()).first()
+        if prev:
+            prev.status = "active"
+        self.db.commit()
+        self.db.refresh(release)
+        invalidate_field_perm_cache()
+        return release
+
+    def get_active_masking_policy(self) -> Optional[Dict[str, Any]]:
+        import json
+        release = self.db.query(MaskingPolicyRelease).filter(
+            MaskingPolicyRelease.status == "active"
+        ).first()
+        if not release:
+            return None
+        try:
+            payload = json.loads(release.policy_payload)
+        except Exception:
+            payload = {}
+        return {
+            "policy_version": release.policy_version,
+            "checksum": release.checksum,
+            "gray_percent": release.gray_percent,
+            "gray_tags": release.gray_tags.split(",") if release.gray_tags else [],
+            "subscriber_ids": release.subscriber_ids.split(",") if release.subscriber_ids else [],
+            "policy_payload": payload,
+            "released_at": release.released_at
+        }
+
+    def apply_released_masking_policy(
+        self, data: Dict[str, Any], resource: str,
+        gray_user_tag: Optional[str] = None
+    ) -> Dict[str, Any]:
+        policy_info = self.get_active_masking_policy()
+        if not policy_info:
+            return data
+        gray_percent = policy_info.get("gray_percent", 100)
+        gray_tags = policy_info.get("gray_tags", [])
+        in_gray = True
+        if gray_percent < 100:
+            if gray_user_tag and gray_tags:
+                in_gray = gray_user_tag in gray_tags
+            elif gray_percent <= 0:
+                in_gray = False
+            else:
+                tag = f"{resource}:{gray_user_tag or 'default'}"
+                bucket = hash(tag) % 100
+                in_gray = bucket < gray_percent
+        if not in_gray:
+            return data
+        policy_payload = policy_info.get("policy_payload", {})
+        rules = policy_payload.get(resource, {})
+        import copy
+        result = copy.deepcopy(data)
+        for field_name, rule in rules.items():
+            if field_name not in result:
+                continue
+            if isinstance(rule, dict):
+                action = rule.get("action", "visible")
+                pattern = rule.get("pattern")
+            else:
+                action = rule
+                pattern = None
+            if action == "hidden":
+                del result[field_name]
+            elif action == "masked" and result[field_name] is not None:
+                val = str(result[field_name])
+                if pattern == "name" and len(val) >= 2:
+                    result[field_name] = val[0] + "*" * (len(val) - 1)
+                elif pattern == "phone" and len(val) >= 7:
+                    result[field_name] = val[:3] + "****" + val[-4:]
+                elif pattern == "email" and "@" in val:
+                    name, domain = val.split("@", 1)
+                    result[field_name] = (name[:2] + "***@" + domain) if len(name) >= 2 else ("***@" + domain)
+                else:
+                    result[field_name] = "*" * len(val)
+        return result
